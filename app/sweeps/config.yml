@@ -1,13 +1,21 @@
+# app/sweeps/config.yaml
+defaults:
+  - _self_
+
 model:
-  backbone: resnet18
+  backbone: "resnet18"
   pretrained: true
   dropout: 0.2
+  num_classes: 2
 
 data:
   include_mask: false
-  normalization: per_crop
+  normalization: "per_crop"
+  index_path: "/path/to/index.json"  # replace with your index builder output
 
 training:
-  lr: 0.0003
+  lr: 3e-4
   batch_size: 128
   epochs: 20
+  num_workers: 4
+  weight_decay: 1e-4
