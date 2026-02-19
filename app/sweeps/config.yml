@@ -1,0 +1,13 @@
+model:
+  backbone: resnet18
+  pretrained: true
+  dropout: 0.2
+
+data:
+  include_mask: false
+  normalization: per_crop
+
+training:
+  lr: 0.0003
+  batch_size: 128
+  epochs: 20
