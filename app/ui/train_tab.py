@@ -111,10 +111,17 @@ class TrainTab(QWidget):
         # --- Scoring row ---
         row2 = QHBoxLayout()
         self.score_col = QLineEdit(f"model_score_{time.strftime('%Y%m%d_%H%M%S')}")
+        
+        from PyQt5.QtWidgets import QFileDialog
+        self.btn_load_ckpt = QPushButton("Load Model Checkpoint")
+        self.btn_load_ckpt.clicked.connect(self.load_checkpoint_clicked)
+
         self.btn_score = QPushButton("Score selected HDF5s -> write score column")
         self.btn_score.clicked.connect(self.score_clicked)
+        
         row2.addWidget(QLabel("Score column:"))
         row2.addWidget(self.score_col)
+        row2.addWidget(self.btn_load_ckpt) # Added to layout
         row2.addWidget(self.btn_score)
         lay.addLayout(row2)
 
@@ -223,6 +230,38 @@ class TrainTab(QWidget):
             else:
                 keys.append((int(it.y), -1))
         return np.array([hash(k) for k in keys], dtype=np.int64)
+
+    def load_checkpoint_clicked(self):
+        from PyQt5.QtWidgets import QFileDialog
+        import torch
+        from ..ml.models import SimpleCNN, make_timm_frozen_linear
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Checkpoint", str(self.annotate_tab.root_dir or ""), "PyTorch Checkpoints (*.pt *.pth)"
+        )
+        if not path:
+            return
+
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+            t_cfg = ckpt.get("train_config", {})
+            kind = t_cfg.get("model_kind", "simple_cnn")
+            timm_name = t_cfg.get("timm_name", "resnet18")
+
+            if kind == "simple_cnn":
+                model = SimpleCNN(in_ch=4, n_classes=2)
+            else:
+                model = make_timm_frozen_linear(timm_name, in_chans=4, n_classes=2)
+
+            model.load_state_dict(ckpt["model_state_dict"])
+            self.model = model
+            
+            self._log(f"Successfully loaded {kind} model from {path}")
+            QMessageBox.information(self, "Success", f"Model loaded from:\n{path}")
+            
+        except Exception as e:
+            self._log(f"[error] Failed to load checkpoint: {e}")
+            QMessageBox.warning(self, "Load Error", f"Failed to load checkpoint:\n{e}")
 
     def train_clicked(self):
         if not self.annotate_tab.root_dir:
@@ -424,17 +463,21 @@ class TrainTab(QWidget):
 
         def _score_job(log_cb):
             for fp in paths:
-                log_cb(f"Scoring {_basename(fp)} ...")
-                score_h5_file(
-                    self.model, fp,
-                    score_col=score_col,
-                    image_key=self.cfg.image_key,
-                    features_key=self.cfg.features_key,
-                    device="cuda",
-                    batch_size=256,
-                    target_hw=75,
-                    log_cb=log_cb,
-                )
+                try:
+                    log_cb(f"Scoring {_basename(fp)} ...")
+                    score_h5_file(
+                        self.model, fp,
+                        score_col=score_col,
+                        image_key=self.cfg.image_key,
+                        features_key=self.cfg.features_key,
+                        device="cuda",
+                        batch_size=256,
+                        target_hw=75,
+                        log_cb=log_cb,
+                    )
+                except Exception as e:
+                    # If one file fails, log the error but CONTINUE to the next file!
+                    log_cb(f"[ERROR] Failed to score {_basename(fp)}: {e}")
 
         run_in_thread(
             _score_job,
