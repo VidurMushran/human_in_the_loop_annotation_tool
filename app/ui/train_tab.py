@@ -6,6 +6,7 @@ import time
 import itertools
 import numpy as np
 import pandas as pd
+import h5py  # Added for channel detection
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -67,7 +68,7 @@ class TrainTab(QWidget):
         self.method_menu = MultiCheckDropdown("Training Method")
         self.method_menu.add_option("supervised", True)
         self.method_menu.add_option("self-supervised", False)
-        self.method_menu.add_option("pseudo-labeling", False) # NEW: Weakly Supervised
+        self.method_menu.add_option("pseudo-labeling", False) 
 
         self.aug_menu = MultiCheckDropdown("Augmentations")
         self.aug_menu.add_option("hflip", True)
@@ -118,7 +119,6 @@ class TrainTab(QWidget):
         rowS.addWidget(QLabel("Val frac:"))
         rowS.addWidget(self.val_frac)
         
-        # Add PL Settings to Layout
         rowS.addWidget(QLabel("PL Iters:"))
         rowS.addWidget(self.pl_iters)
         rowS.addWidget(QLabel("PL Thresh:"))
@@ -158,7 +158,6 @@ class TrainTab(QWidget):
         # --- Scoring row ---
         row2 = QHBoxLayout()
         self.score_col = QLineEdit(f"model_score_{time.strftime('%Y%m%d_%H%M%S')}")
-        from PyQt5.QtWidgets import QFileDialog
         self.btn_load_ckpt = QPushButton("Load Model Checkpoint")
         self.btn_load_ckpt.clicked.connect(self.load_checkpoint_clicked)
         self.btn_score = QPushButton("Score selected HDF5s -> write score column")
@@ -204,7 +203,6 @@ class TrainTab(QWidget):
         runs_root = Path(runs_root)
         runs_root.mkdir(parents=True, exist_ok=True)
         
-        # Add descriptive suffix to the timestamp
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         dir_name = f"{timestamp}_{suffix}" if suffix else timestamp
         
@@ -313,6 +311,7 @@ class TrainTab(QWidget):
             timm_name = t_cfg.get("timm_name", "resnet18")
 
             if kind == "simple_cnn":
+                # Assuming 4 channels as default if not in config
                 model = SimpleCNN(in_ch=4, n_classes=2)
             else:
                 model = make_timm_frozen_linear(timm_name, in_chans=4, n_classes=2)
@@ -337,6 +336,23 @@ class TrainTab(QWidget):
             QMessageBox.warning(self, "No files selected", "Select at least one file in the table.")
             return
 
+        # --- AUTO-DETECT CHANNELS ---
+        # Inspect first file to determine base channels (usually 3 or 4)
+        base_channels = 3 # fallback default
+        if specs:
+            try:
+                first_fp = specs[0][0]
+                with h5py.File(first_fp, 'r') as f:
+                    # dataset.py assumes HWC, so we check last dimension
+                    if self.cfg.image_key in f:
+                        shape = f[self.cfg.image_key].shape
+                        if len(shape) == 4:
+                            base_channels = shape[-1]
+                        self._log(f"Auto-detected base channels from {os.path.basename(first_fp)}: {base_channels}")
+            except Exception as e:
+                self._log(f"[warn] Could not auto-detect channels: {e}. Defaulting to 3.")
+        # ----------------------------
+
         selected_models = self.model_menu.selected()
         selected_inputs = self.inputs_menu.selected()
         selected_methods = self.method_menu.selected()
@@ -353,7 +369,6 @@ class TrainTab(QWidget):
         unlabeled_items_pool = []
         per_file_counts = {}
 
-        # Parse Explicit Labels vs Unlabeled
         for fp, mode in specs:
             if mode == "unlabeled (all rows)":
                 try:
@@ -380,7 +395,6 @@ class TrainTab(QWidget):
         if len(initial_labeled_items) < 10 and "supervised" in selected_methods:
             QMessageBox.warning(self, "Too few labels", "Found very few labeled rows. Supervised training may fail.")
 
-        # Split Initial Labeled Data once for consistency across runs
         rng = np.random.default_rng(0)
         idx = rng.permutation(len(initial_labeled_items))
         n_test = int(float(self.test_frac.value()) * len(initial_labeled_items))
@@ -422,12 +436,17 @@ class TrainTab(QWidget):
                 seed=0,
             )
 
+            # Determine dynamic input channels
+            # If base is 4, image_only=4. If image_and_mask, 4+1=5.
+            dynamic_in_channels = base_channels
+            if inputs_mode == "image_and_mask":
+                dynamic_in_channels += 1
+
             if method == "pseudo-labeling":
-                # --- PSEUDO-LABELING WORKER ---
                 pl_iterations = int(self.pl_iters.value())
                 pl_threshold = float(self.pl_thresh.value())
 
-                def build_pl_closure(current_cfg, j_name, init_labeled, init_unlabeled, t_name):
+                def build_pl_closure(current_cfg, j_name, init_labeled, init_unlabeled, t_name, in_ch):
                     def _job(log_cb):
                         log_cb(f"Starting Pseudo-Labeling job: {j_name}")
                         
@@ -435,33 +454,30 @@ class TrainTab(QWidget):
                         current_train_pool = copy.deepcopy(init_labeled)
                         current_unlabeled_pool = copy.deepcopy(init_unlabeled)
                         
-                        # Generate a val split specifically from initial trusted labels
                         rng = np.random.default_rng(0)
                         idx = rng.permutation(len(current_train_pool))
                         n_val = int(0.20 * len(current_train_pool))
                         current_val_pool = [current_train_pool[i] for i in idx[:n_val]]
                         current_train_pool = [current_train_pool[i] for i in idx[n_val:]]
                         
-                        in_channels = 4 if current_cfg.inputs_mode == "image_and_mask" else 3
-                        
                         for iter_idx in range(pl_iterations):
                             log_cb(f"\n--- PL Iteration {iter_idx+1}/{pl_iterations} ---")
                             log_cb(f"Train size: {len(current_train_pool)} | Unlabeled pool: {len(current_unlabeled_pool)}")
                             
-                            # 1. Reset Model to prevent confirmation bias scaling indefinitely
+                            # Use DYNAMIC channels
                             if current_cfg.model_kind == "simple_cnn":
-                                model = SimpleCNN(in_ch=in_channels, n_classes=2)
+                                model = SimpleCNN(in_ch=in_ch, n_classes=2)
                             else:
-                                model = make_timm_frozen_linear(t_name, in_chans=in_channels, n_classes=2)
+                                model = make_timm_frozen_linear(t_name, in_chans=in_ch, n_classes=2)
                             
-                            # 2. Train Model using standard supervised logic
                             current_cfg.training_method = "supervised"
                             trained_model, best = train_model(model, current_train_pool, current_val_pool, current_cfg, log_cb=log_cb)
                             self.model = trained_model
                             
                             if iter_idx == pl_iterations - 1 or len(current_unlabeled_pool) == 0:
-                                # Save artifacts on final iteration
-                                run_dir = self._create_run_dir()
+                                safe_arch = t_name if current_cfg.model_kind == "timm_frozen" else "simple_cnn"
+                                suffix = f"{safe_arch}_{current_cfg.inputs_mode}_PL"
+                                run_dir = self._create_run_dir(suffix=suffix)
                                 self.last_run_dir = run_dir
                                 extra = {"job_name": j_name, "mode": "pseudo-labeling", "n_train_final": len(current_train_pool)}
                                 write_run_yaml(run_dir, cfg=current_cfg.__dict__, extra=extra)
@@ -475,7 +491,6 @@ class TrainTab(QWidget):
                                 log_cb(f"Finished. Final run saved to {run_dir}")
                                 break
                                 
-                            # 3. Score Unlabeled Data
                             log_cb("Scoring unlabeled pool...")
                             trained_model.eval()
                             trained_model.to(current_cfg.device)
@@ -516,21 +531,20 @@ class TrainTab(QWidget):
 
                     return _job
                 
-                run_func = build_pl_closure(cfg, job_name, initial_labeled_items, unlabeled_items_pool, timm_name)
+                run_func = build_pl_closure(cfg, job_name, initial_labeled_items, unlabeled_items_pool, timm_name, dynamic_in_channels)
                 self.queue_manager.add_job(job_name, run_func)
 
             else:
-                # --- STANDARD SUPERVISED / SELF-SUPERVISED WORKER ---
-                def build_std_closure(current_cfg, j_name, t_items, v_items, t_name):
+                def build_std_closure(current_cfg, j_name, t_items, v_items, t_name, in_ch):
                     def _job(log_cb):
                         log_cb(f"Starting sweep job: {j_name}")
-                        in_channels = 4 if current_cfg.inputs_mode == "image_and_mask" else 3
+                        
+                        # Use DYNAMIC channels
                         if current_cfg.model_kind == "simple_cnn":
-                            model = SimpleCNN(in_ch=in_channels, n_classes=2)
+                            model = SimpleCNN(in_ch=in_ch, n_classes=2)
                         else:
-                            model = make_timm_frozen_linear(t_name, in_chans=in_channels, n_classes=2)
+                            model = make_timm_frozen_linear(t_name, in_chans=in_ch, n_classes=2)
 
-                        # Create a safe suffix without spaces or colons
                         safe_arch = t_name if current_cfg.model_kind == "timm_frozen" else "simple_cnn"
                         suffix = f"{safe_arch}_{current_cfg.inputs_mode}_{current_cfg.training_method}"
                         run_dir = self._create_run_dir(suffix=suffix)
@@ -554,9 +568,8 @@ class TrainTab(QWidget):
 
                     return _job
                 
-                run_func = build_std_closure(cfg, job_name, train_items, val_items, timm_name)
+                run_func = build_std_closure(cfg, job_name, train_items, val_items, timm_name, dynamic_in_channels)
                 self.queue_manager.add_job(job_name, run_func)
-
 
     def score_clicked(self):
         if self.model is None:
