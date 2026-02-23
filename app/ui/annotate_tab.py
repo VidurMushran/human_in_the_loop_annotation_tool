@@ -85,7 +85,11 @@ class AnnotateTab(QWidget):
         self.label_col = cfg.default_label_col
         self.sort_col = cfg.default_score_col
         self.sort_asc = False
+        
+        # Pagination variables
         self.page = 0
+        self.page_left = 0
+        self.page_right = 0
 
         self._build_ui()
 
@@ -230,11 +234,42 @@ class AnnotateTab(QWidget):
 
         # ---- Navigation row ----
         nav = QHBoxLayout()
+        
+        # Single mode nav
         self.btn_prev = QPushButton("Prev")
         self.btn_next = QPushButton("Next")
         self.lbl_page = QLabel("Page 0")
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_next.clicked.connect(self.next_page)
+
+        # Dual mode nav - LEFT
+        self.btn_prev_left = QPushButton("Prev Left")
+        self.btn_next_left = QPushButton("Next Left")
+        self.lbl_page_left = QLabel("L Page 0")
+        self.btn_prev_left.clicked.connect(self.prev_page_left)
+        self.btn_next_left.clicked.connect(self.next_page_left)
+
+        # Dual mode nav - RIGHT
+        self.btn_prev_right = QPushButton("Prev Right")
+        self.btn_next_right = QPushButton("Next Right")
+        self.lbl_page_right = QLabel("R Page 0")
+        self.btn_prev_right.clicked.connect(self.prev_page_right)
+        self.btn_next_right.clicked.connect(self.next_page_right)
+
+        # Add all to layout
+        nav.addWidget(self.btn_prev)
+        nav.addWidget(self.btn_next)
+        nav.addWidget(self.lbl_page)
+
+        nav.addWidget(self.btn_prev_left)
+        nav.addWidget(self.btn_next_left)
+        nav.addWidget(self.lbl_page_left)
+
+        nav.addWidget(self.btn_prev_right)
+        nav.addWidget(self.btn_next_right)
+        nav.addWidget(self.lbl_page_right)
+        
+        nav.addStretch(1)
 
         # Select-all buttons
         self.btn_select_all = QPushButton("Select all (this page) → active label")
@@ -245,6 +280,10 @@ class AnnotateTab(QWidget):
 
         self.btn_select_all_right = QPushButton("Select all RIGHT → active label")
         self.btn_select_all_right.clicked.connect(self.select_all_right_page)
+        
+        # Label Entire button
+        self.btn_label_entire = QPushButton("Label entire selected HDF5s → active label")
+        self.btn_label_entire.clicked.connect(self.label_entire_selected_files)
 
         self.btn_save = QPushButton("Save annotations (writes to features)")
         self.btn_save.clicked.connect(self.save_current_view)
@@ -253,14 +292,10 @@ class AnnotateTab(QWidget):
         self.btn_rebuild_vidur = QPushButton("Rebuild vidur_junk / vidur_cells from labels")
         self.btn_rebuild_vidur.clicked.connect(self.rebuild_vidur_files_from_labels)
 
-        nav.addWidget(self.btn_prev)
-        nav.addWidget(self.btn_next)
-        nav.addWidget(self.lbl_page)
-        nav.addStretch(1)
-
         nav.addWidget(self.btn_select_all)
         nav.addWidget(self.btn_select_all_left)
         nav.addWidget(self.btn_select_all_right)
+        nav.addWidget(self.btn_label_entire)
 
         nav.addWidget(self.btn_save)
         nav.addWidget(self.btn_rebuild_vidur)
@@ -304,8 +339,18 @@ class AnnotateTab(QWidget):
         self.dual_left_pane.setVisible(dual)
         self.dual_right_pane.setVisible(dual)
 
-        self.btn_prev.setEnabled(not dual)
-        self.btn_next.setEnabled(not dual)
+        # Single nav visibility
+        self.btn_prev.setVisible(not dual)
+        self.btn_next.setVisible(not dual)
+        self.lbl_page.setVisible(not dual)
+
+        # Dual nav visibility
+        self.btn_prev_left.setVisible(dual)
+        self.btn_next_left.setVisible(dual)
+        self.lbl_page_left.setVisible(dual)
+        self.btn_prev_right.setVisible(dual)
+        self.btn_next_right.setVisible(dual)
+        self.lbl_page_right.setVisible(dual)
 
         # show correct select-all buttons
         self.btn_select_all.setVisible(not dual)
@@ -315,7 +360,11 @@ class AnnotateTab(QWidget):
     # ---------------- Events ----------------
 
     def pick_root(self):
-        d = QFileDialog.getExistingDirectory(self, "Select a directory", str(Path.cwd()))
+        default_dir = "/mnt/deepstore/Vidur/Junk_Classification/data"
+        if not os.path.exists(default_dir):
+            default_dir = str(Path.cwd())
+            
+        d = QFileDialog.getExistingDirectory(self, "Select a directory", default_dir)
         if not d:
             return
 
@@ -367,6 +416,8 @@ class AnnotateTab(QWidget):
 
     def on_dual_changed(self):
         self.page = 0
+        self.page_left = 0
+        self.page_right = 0
         self._sync_gallery_visibility()
         self.render_page()
 
@@ -497,28 +548,45 @@ class AnnotateTab(QWidget):
         if self.sort_col not in self.index.table.columns:
             self.dual_left_pane.set_tiles([])
             self.dual_right_pane.set_tiles([])
-            self.lbl_page.setText(f"Dual view: missing sort col '{self.sort_col}'")
+            self.lbl_page_left.setText(f"Error: missing sort col '{self.sort_col}'")
+            self.lbl_page_right.setText(f"Error: missing sort col '{self.sort_col}'")
             return
 
         N = int(self.spin_topn.value())
+        ps = int(self.page_size.value()) # Get page size
+        
         df = self.index.table.copy()
         score = pd_to_float_safe(df[self.sort_col])
         df = df[np.isfinite(score)].copy()
         if len(df) == 0:
             self.dual_left_pane.set_tiles([])
             self.dual_right_pane.set_tiles([])
-            self.lbl_page.setText("Dual view: no finite scores")
+            self.lbl_page_left.setText("Dual view: no finite scores")
+            self.lbl_page_right.setText("Dual view: no finite scores")
             return
 
         top = df.nlargest(N, self.sort_col)
         bot = df.nsmallest(N, self.sort_col)
 
-        self.lbl_page.setText(f"Dual Top-N (N={min(N, len(df))})")
+        # --- LEFT PANE PAGINATION ---
+        start_left = self.page_left * ps
+        start_left = max(0, min(start_left, max(0, len(top) - ps)))
+        self.page_left = start_left // ps
+        view_top = top.iloc[start_left : start_left + ps]
+        self.lbl_page_left.setText(f"L Page {self.page_left} ({start_left+1}-{min(start_left+ps, len(top))}/{len(top)})")
+
+        # --- RIGHT PANE PAGINATION ---
+        start_right = self.page_right * ps
+        start_right = max(0, min(start_right, max(0, len(bot) - ps)))
+        self.page_right = start_right // ps
+        view_bot = bot.iloc[start_right : start_right + ps]
+        self.lbl_page_right.setText(f"R Page {self.page_right} ({start_right+1}-{min(start_right+ps, len(bot))}/{len(bot)})")
+
         self.dual_left_pane.set_title(f"Top junk (high {self.sort_col})")
         self.dual_right_pane.set_title(f"Top cells (low {self.sort_col})")
 
-        tiles_top = self._tiles_from_view(top)
-        tiles_bot = self._tiles_from_view(bot)
+        tiles_top = self._tiles_from_view(view_top)
+        tiles_bot = self._tiles_from_view(view_bot)
 
         self._apply_gallery_layouts()
         self.dual_left_pane.set_tiles(tiles_top)
@@ -600,6 +668,22 @@ class AnnotateTab(QWidget):
         self.page = max(0, self.page - 1)
         self.render_page()
 
+    def next_page_left(self):
+        self.page_left += 1
+        self.render_page()
+
+    def prev_page_left(self):
+        self.page_left = max(0, self.page_left - 1)
+        self.render_page()
+
+    def next_page_right(self):
+        self.page_right += 1
+        self.render_page()
+
+    def prev_page_right(self):
+        self.page_right = max(0, self.page_right - 1)
+        self.render_page()
+
     # ---------------- Click ----------------
 
     def on_tile_clicked(self, h5_path: str, row_idx: int, button: str):
@@ -608,7 +692,7 @@ class AnnotateTab(QWidget):
         self.dual_left_pane.set_tile_label(h5_path, row_idx, new_label)
         self.dual_right_pane.set_tile_label(h5_path, row_idx, new_label)
 
-    # ---------------- Select All ----------------
+    # ---------------- Select All & Label Entire File ----------------
 
     def select_all_current_page(self):
         """Single view: set all visible tiles to active label."""
@@ -627,6 +711,41 @@ class AnnotateTab(QWidget):
         tiles = list(self.dual_right_pane.tiles() or [])
         for t in tiles:
             self.dual_right_pane.set_tile_label(t["h5_path"], int(t["row_idx"]), self.active_label)
+
+    def label_entire_selected_files(self):
+        """Apply the active label to EVERY row in the currently selected HDF5 files."""
+        if not self.selected_paths:
+            QMessageBox.information(self, "No files", "Select at least one HDF5 file in the file list on the left.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"Set ALL rows in {len(self.selected_paths)} selected file(s) to '{self.active_label}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        v = self._storage_label_from_ui(self.active_label)
+        val = float(v) if np.isfinite(v) else np.nan
+
+        import h5py
+        from ..data.h5io import write_features_column_inplace
+        
+        count = 0
+        for fp in self.selected_paths:
+            try:
+                # Use the images block to figure out the row count
+                with h5py.File(fp, "r") as f:
+                    n = f[self.cfg.image_key].shape[0]
+                arr = np.full(n, val, dtype=np.float32)
+                write_features_column_inplace(fp, self.label_col, arr, features_key=self.cfg.features_key)
+                count += 1
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to label {os.path.basename(fp)}:\n{e}")
+        
+        QMessageBox.information(self, "Done", f"Labeled {count} file(s) entirely as '{self.active_label}'.")
+        self.rebuild_index()
 
     # ---------------- Save / Rebuild ----------------
 

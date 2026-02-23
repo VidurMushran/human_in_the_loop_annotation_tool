@@ -1,18 +1,27 @@
 from __future__ import annotations
+import os
 import numpy as np
 import pandas as pd
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QMessageBox
+import torch
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QMessageBox, QFileDialog
 from app.metrics.eval import binary_metrics
 from app.ui.widgets.matplotlib_canvas import MplCanvas
 from app.data.h5io import read_features_columns, read_images_by_indices
 from app.imaging.render import channels_to_rgb8bit
 from app.ui.widgets.gallery import GalleryWidget
+from app.ml.models import SimpleCNN, make_timm_frozen_linear
+from app.ml.score import score_h5_file
+from app.utils.qt_threading import run_in_thread
+
+def _basename(p: str) -> str:
+    return os.path.basename(p) if p else p
 
 class MetricsTab(QWidget):
     def __init__(self, cfg, annotate_tab):
         super().__init__()
         self.cfg = cfg
         self.annotate_tab = annotate_tab
+        self.model = None
         self._build()
 
     def _build(self):
@@ -20,11 +29,20 @@ class MetricsTab(QWidget):
 
         top = QHBoxLayout()
         self.score_col = QLineEdit(self.cfg.default_score_col)
+        
+        self.btn_load_ckpt = QPushButton("Load Model Checkpoint")
+        self.btn_load_ckpt.clicked.connect(self.load_checkpoint_clicked)
+        
+        self.btn_score = QPushButton("Score selected HDF5s")
+        self.btn_score.clicked.connect(self.score_clicked)
+
         self.btn_eval = QPushButton("Compute metrics on selected files")
         self.btn_eval.clicked.connect(self.compute)
 
-        top.addWidget(QLabel("Score column:"))
+        top.addWidget(QLabel("Score col:"))
         top.addWidget(self.score_col)
+        top.addWidget(self.btn_load_ckpt)
+        top.addWidget(self.btn_score)
         top.addWidget(self.btn_eval)
         lay.addLayout(top)
 
@@ -45,6 +63,82 @@ class MetricsTab(QWidget):
         galrow.addWidget(self.g_fp, 1)
         galrow.addWidget(self.g_fn, 1)
         lay.addLayout(galrow, 2)
+        
+        self.status_lbl = QLabel("Ready")
+        lay.addWidget(self.status_lbl)
+
+    def load_checkpoint_clicked(self):
+        default_dir = "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/runs"
+        if not os.path.exists(default_dir):
+            default_dir = str(self.annotate_tab.root_dir or "")
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Checkpoint", default_dir, "PyTorch Checkpoints (*.pt *.pth)"
+        )
+        if not path:
+            return
+
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+            t_cfg = ckpt.get("train_config", {})
+            kind = t_cfg.get("model_kind", "simple_cnn")
+            timm_name = t_cfg.get("timm_name", "resnet18")
+
+            if kind == "simple_cnn":
+                model = SimpleCNN(in_ch=4, n_classes=2)
+            else:
+                model = make_timm_frozen_linear(timm_name, in_chans=4, n_classes=2)
+
+            model.load_state_dict(ckpt["model_state_dict"])
+            self.model = model
+            
+            self.status_lbl.setText(f"Loaded {kind} model from {os.path.basename(path)}")
+            QMessageBox.information(self, "Success", f"Model loaded from:\n{path}")
+        except Exception as e:
+            self.status_lbl.setText(f"Failed to load checkpoint")
+            QMessageBox.warning(self, "Load Error", f"Failed to load checkpoint:\n{e}")
+
+    def score_clicked(self):
+        if self.model is None:
+            QMessageBox.information(self, "No model", "Load a model checkpoint first.")
+            return
+
+        paths = self.annotate_tab.selected_paths
+        if not paths:
+            QMessageBox.information(self, "No files", "Select at least one HDF5 in the Annotate tab.")
+            return
+
+        score_col = self.score_col.text().strip()
+        if not score_col:
+            return
+
+        self.status_lbl.setText(f"Scoring {len(paths)} file(s) into column: {score_col}...")
+        self.btn_score.setEnabled(False)
+
+        def _score_job(log_cb):
+            for fp in paths:
+                try:
+                    log_cb(f"Scoring {_basename(fp)} ...")
+                    score_h5_file(
+                        self.model, fp,
+                        score_col=score_col,
+                        image_key=self.cfg.image_key,
+                        features_key=self.cfg.features_key,
+                        device="cuda",
+                        batch_size=256,
+                        target_hw=75,
+                        log_cb=log_cb,
+                    )
+                except Exception as e:
+                    log_cb(f"Failed to score {_basename(fp)}: {e}")
+
+        run_in_thread(
+            _score_job,
+            parent=self,
+            on_log=lambda s: self.status_lbl.setText(s),
+            on_error=lambda e: QMessageBox.warning(self, "Scoring Error", str(e)),
+            on_done=lambda: [self.status_lbl.setText("Scoring finished. You can now compute metrics."), self.btn_score.setEnabled(True)],
+        )
 
     def compute(self):
         paths = self.annotate_tab.selected_paths
@@ -62,18 +156,31 @@ class MetricsTab(QWidget):
         for fp in paths:
             df = read_features_columns(fp, [label_col, score_col], features_key=self.cfg.features_key)
             s = df[label_col].astype(str).str.lower()
-            mask = s.str.contains("junk") | s.str.contains("cell")
+            
+            # Support both string labels ("junk"/"cell") and numeric representations (1.0/0.0)
+            mask_junk = s.str.contains("junk") | (s == "1.0") | (s == "1")
+            mask_cell = s.str.contains("cell") | (s == "0.0") | (s == "0")
+            mask = mask_junk | mask_cell
+            
             if mask.sum() == 0:
                 continue
-            yt = np.where(s[mask].str.contains("junk"), 1, 0).astype(int)
+                
+            yt = np.where(mask_junk[mask], 1, 0).astype(int)
             ys = df.loc[mask, score_col].astype(float).to_numpy()
-            idxs = np.where(mask.to_numpy())[0]
+            
+            # Filter out any NaNs that might have been loaded before metrics parsing
+            valid_score_mask = ~np.isnan(ys)
+            yt = yt[valid_score_mask]
+            ys = ys[valid_score_mask]
+            
+            idxs = np.where(mask.to_numpy())[0][valid_score_mask]
+            
             y_true.append(yt)
             y_score.append(ys)
             refs.extend([(fp, int(i)) for i in idxs])
 
-        if not y_true:
-            QMessageBox.warning(self, "No labeled rows", f"No rows with '{label_col}' containing 'junk' or 'cell'.")
+        if not y_true or len(np.concatenate(y_true)) == 0:
+            QMessageBox.warning(self, "No valid rows", f"No valid rows with '{label_col}' (junk/cell/1/0) and finite '{score_col}'.")
             return
 
         y_true = np.concatenate(y_true)
@@ -143,5 +250,5 @@ class MetricsTab(QWidget):
                 "tooltip": f"{title}\n{fp}\nidx={ridx}"
             })
 
-        gal.set_layout(n_cols=6, tile_px=84)
+        gal.set_layout(n_cols=6, tile_h=84, tile_w=84)
         gal.set_tiles(tiles)

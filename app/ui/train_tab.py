@@ -236,8 +236,12 @@ class TrainTab(QWidget):
         import torch
         from ..ml.models import SimpleCNN, make_timm_frozen_linear
 
+        default_dir = "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/runs"
+        if not os.path.exists(default_dir):
+            default_dir = str(self.annotate_tab.root_dir or "")
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Checkpoint", str(self.annotate_tab.root_dir or ""), "PyTorch Checkpoints (*.pt *.pth)"
+            self, "Select Checkpoint", default_dir, "PyTorch Checkpoints (*.pt *.pth)"
         )
         if not path:
             return
