@@ -312,11 +312,26 @@ class AnnotateTab(QWidget):
 
     # File Ops
     def label_entire_selected_files(self):
-        if not self.selected_paths: return QMessageBox.info(self, "No files", "Select files.")
-        if QMessageBox.question(self, "Confirm", f"Label {len(self.selected_paths)} files as '{self.active_label}'?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        if not self.selected_paths: 
+            return QMessageBox.information(self, "No files", "Select files.")
+        
+        reply = QMessageBox.question(
+            self, "Confirm", 
+            f"Set ALL rows in {len(self.selected_paths)} files to '{self.active_label}'?", 
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes: return
+
+        # Convert UI string to storage value (1.0 or 0.0)
         val = self._storage_label_from_ui(self.active_label)
         v = float(val) if np.isfinite(val) else np.nan
-        cnt, errs = batch_label_files(self.selected_paths, self.label_col, v, self.cfg.image_key, self.cfg.features_key)
+
+        # Use batch op
+        cnt, errs = batch_label_files(
+            self.selected_paths, self.label_col, v, 
+            self.cfg.image_key, self.cfg.features_key
+        )
+        
         if errs: QMessageBox.warning(self, "Errors", "\n".join(errs))
         QMessageBox.information(self, "Done", f"Labeled {cnt} files.")
         self.rebuild_index()

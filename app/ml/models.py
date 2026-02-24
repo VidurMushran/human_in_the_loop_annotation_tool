@@ -22,15 +22,9 @@ class SimpleCNN(nn.Module):
         self.classifier = nn.Linear(embed_dim, n_classes)
 
     def forward(self, x, features=None):
-        # x: images, features: optional 1D vector
         x = self.feat(x)
         emb = self.projector(x)
-        
-        if features is not None:
-            # Placeholder for future feature fusion if desired
-            pass
-            
-        return emb  # Return embedding. Caller applies classifier if needed.
+        return emb
 
 class TimmModel(nn.Module):
     def __init__(self, name, in_chans=3, n_classes=2, embed_dim=128):
@@ -55,9 +49,9 @@ class TimmModel(nn.Module):
         self.classifier = nn.Linear(embed_dim, n_classes)
 
     def forward(self, x, features=None):
-        x = self.backbone(x)
-        emb = self.projector(x)
-        return emb
+        emb = self.backbone(x)
+        proj = self.projector(emb)
+        return proj
 
 def make_model(kind: str, timm_name: str, in_chans: int, n_classes: int = 2):
     """

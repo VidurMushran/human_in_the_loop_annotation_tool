@@ -1,32 +1,29 @@
 from PyQt5.QtWidgets import QMainWindow, QTabWidget
-from app.utils.config import load_config, save_config
-from app.ui.annotate_tab import AnnotateTab
-from app.ui.train_tab import TrainTab
-from app.ui.metrics_tab import MetricsTab
-from junk_gui_app.app.ui.comparison_tab import ComparisonTab
-
+from .annotate_tab import AnnotateTab
+from .train_tab import TrainTab
+from .metrics_tab import MetricsTab
+from .comparison_tab import ComparisonTab
+from .cluster_tab import ClusterTab # NEW
+from ..utils.config import AppConfig
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Junk ↔ Cells Human-in-the-loop Trainer (PyQt)")
+        self.setWindowTitle("Junk Annotation Tool")
         self.resize(1400, 900)
-
-        self.cfg = load_config()
-
+        self.cfg = AppConfig()
+        
         tabs = QTabWidget()
         self.annotate_tab = AnnotateTab(self.cfg)
         self.train_tab = TrainTab(self.cfg, self.annotate_tab)
         self.metrics_tab = MetricsTab(self.cfg, self.annotate_tab)
-        self.comparison_tab = ComparisonTab(self.cfg, self.annotate_tab)
-
+        self.comp_tab = ComparisonTab(self.cfg, self.annotate_tab)
+        self.cluster_tab = ClusterTab(self.cfg, self.annotate_tab)
+        
         tabs.addTab(self.annotate_tab, "Annotate")
-        tabs.addTab(self.train_tab, "Train / Score")
+        tabs.addTab(self.cluster_tab, "Cluster Assist")
+        tabs.addTab(self.train_tab, "Train")
         tabs.addTab(self.metrics_tab, "Metrics")
-        tabs.addTab(self.comparison_tab, "Compare Models")
+        tabs.addTab(self.comp_tab, "Compare")
         
         self.setCentralWidget(tabs)
-
-    def closeEvent(self, e):
-        save_config(self.cfg)
-        super().closeEvent(e)

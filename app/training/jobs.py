@@ -9,11 +9,12 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 
 from app.ml.train import train_model, TrainConfig
-from app.ml.models import make_model  # FIX: Use factory
+from app.ml.models import make_model
 from app.ml.dataset import Item, H5StreamDataset
 from app.ml.score import score_h5_file
 from app.data.h5io import read_images_by_indices
 from app.experiments.registry import new_run_dir, write_run_yaml, write_metrics, write_checkpoint
+from app.utils.model_helpers import smart_load_state_dict
 
 def _create_run_dir(runs_root: str, suffix: str = "") -> Path:
     import time
@@ -43,12 +44,14 @@ def run_standard_job(
     # 1. Initialize Model
     model = make_model(cfg.model_kind, timm_name, in_chans)
 
-    # 2. Resume Logic
+    # 2. Resume Logic (Smart Load)
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         log_cb(f"Resuming from {resume_checkpoint}...")
         try:
             ckpt = torch.load(resume_checkpoint, map_location="cpu")
-            model.load_state_dict(ckpt.get("model_state_dict", ckpt))
+            # Use smart load to ignore size mismatches
+            smart_load_state_dict(model, ckpt.get("model_state_dict", ckpt))
+            
             if "optimizer_state_dict" in ckpt:
                 optimizer_state = ckpt["optimizer_state_dict"]
             if "epoch" in ckpt:
@@ -108,7 +111,6 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
     current_train = copy.deepcopy(init_labeled)
     current_unlabeled = copy.deepcopy(init_unlabeled)
     
-    # Create static validation set from labeled data
     rng = np.random.default_rng(0)
     idx = rng.permutation(len(current_train))
     n_val = int(0.20 * len(current_train))
@@ -121,16 +123,12 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
         log_cb(f"\n--- PL Iteration {iter_idx+1}/{pl_iters} ---")
         log_cb(f"Train size: {len(curr_train)} | Unlabeled pool: {len(current_unlabeled)}")
         
-        # Reset model every iteration to prevent drift/overfitting to noise
         model = make_model(cfg.model_kind, timm_name, in_chans)
         
-        # Train (Supervised Mode)
         cfg.training_method = "supervised"
         trained_model, best = train_model(model, curr_train, curr_val, cfg, log_cb=log_cb)
         
-        # Check termination condition
         if iter_idx == pl_iters - 1 or len(current_unlabeled) == 0:
-            # Final Save
             safe_arch = timm_name if cfg.model_kind == "timm_frozen" else "simple_cnn"
             suffix = f"{safe_arch}_{cfg.inputs_mode}_PL"
             run_dir = _create_run_dir(runs_root, suffix=suffix)
@@ -149,7 +147,6 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
             log_cb(f"Finished. Saved to {run_dir}")
             break
             
-        # Bulk Scoring (IO Optimized)
         log_cb("Scoring unlabeled pool...")
         trained_model.eval()
         trained_model.to(cfg.device)
@@ -162,29 +159,22 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
         with torch.no_grad():
             for fp, items in files_to_items.items():
                 row_indices = np.array([it.row_idx for it in items])
-                # Chunk reading
                 for i in range(0, len(items), 256):
                     batch_items = items[i:i+256]
                     batch_idx = row_indices[i:i+256]
                     try:
                         imgs = read_images_by_indices(fp, batch_idx, image_key=cfg.image_key)
-                        
-                        # Handle Mask
-                        if cfg.inputs_mode == "image_and_mask":
-                            # (Simplified: assume mask loading logic is similar or in dataset)
-                            # Ideally we use dataset logic, but for bulk speed we do this:
-                            # If masks required, we must read them. For now, skipping mask read in bulk logic
-                            # to keep it simple, or revert to DataLoader if masks are strictly needed.
-                            pass
-
                         xb = torch.from_numpy(imgs).permute(0, 3, 1, 2).float()
-                        # Resize
                         if xb.shape[-1] != cfg.target_hw:
                             xb = torch.nn.functional.interpolate(xb, size=(cfg.target_hw, cfg.target_hw))
                         
                         xb = xb.to(cfg.device)
                         
-                        # Forward pass (embedding -> classifier)
+                        # Forward pass through backbone -> classifier
+                        # Note: make_model returns a model that outputs embeddings in forward()
+                        # We must call model.classifier explicitly or check if it's supervised
+                        # In app/ml/train.py we do: emb = model(x); logits = model.classifier(emb)
+                        # We must replicate that here:
                         emb = trained_model(xb)
                         logits = trained_model.classifier(emb)
                         probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()

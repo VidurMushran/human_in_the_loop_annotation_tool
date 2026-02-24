@@ -1,9 +1,9 @@
 # app/ui/metrics_tab.py
 from __future__ import annotations
 import os
+import torch
 import numpy as np
 import pandas as pd
-import torch
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, 
     QMessageBox, QFileDialog, QTableWidget, QTableWidgetItem, QAbstractItemView,
@@ -15,7 +15,7 @@ from app.metrics.eval import binary_metrics
 from app.ui.widgets.matplotlib_canvas import MplCanvas
 from app.data.h5io import read_features_columns, read_images_by_indices
 from app.imaging.render import channels_to_rgb8bit
-from app.ui.widgets.gallery_pane import GalleryPane  # FIX: Import GalleryPane
+from app.ui.widgets.gallery_pane import GalleryPane
 from app.utils.qt_threading import run_in_thread
 from app.utils.model_helpers import load_model_from_checkpoint
 from app.experiments.dashboard import parse_runs_directory
@@ -74,18 +74,17 @@ class MetricsTab(QWidget):
         pr = QHBoxLayout(); self.cm_plot = MplCanvas(); self.roc_plot = MplCanvas()
         pr.addWidget(self.cm_plot); pr.addWidget(self.roc_plot); el.addLayout(pr)
         
-        # Galleries (FIX: Use GalleryPane with dummy callback)
+        # Galleries
         gr = QGridLayout()
-        # No-op callback since metrics tab is for viewing
         cb = lambda p,r,b: None 
-        self.gal_tp = GalleryPane("TP", cb); gr.addWidget(self.gal_tp, 0, 0)
-        self.gal_tn = GalleryPane("TN", cb); gr.addWidget(self.gal_tn, 0, 1)
-        self.gal_fp = GalleryPane("FP", cb); gr.addWidget(self.gal_fp, 1, 0)
-        self.gal_fn = GalleryPane("FN", cb); gr.addWidget(self.gal_fn, 1, 1)
+        self.gal_tp = GalleryPane("TP (True Junk)", cb); gr.addWidget(self.gal_tp, 0, 0)
+        self.gal_tn = GalleryPane("TN (True Cell)", cb); gr.addWidget(self.gal_tn, 0, 1)
+        self.gal_fp = GalleryPane("FP (Pred Junk / Is Cell)", cb); gr.addWidget(self.gal_fp, 1, 0)
+        self.gal_fn = GalleryPane("FN (Pred Cell / Is Junk)", cb); gr.addWidget(self.gal_fn, 1, 1)
         el.addLayout(gr, 2)
         
         dl_row = QHBoxLayout()
-        btn_dl = QPushButton("Download Galleries (All Images)"); btn_dl.clicked.connect(self.download_galleries)
+        btn_dl = QPushButton("Download Galleries"); btn_dl.clicked.connect(self.download_galleries)
         dl_row.addStretch(); dl_row.addWidget(btn_dl); dl_row.addStretch()
         el.addLayout(dl_row)
         
@@ -153,23 +152,51 @@ class MetricsTab(QWidget):
         paths = self.annotate_tab.selected_paths
         if not paths: return QMessageBox.warning(self, "No files", "Select files.")
         lc = self.annotate_tab.label_col; sc = self.score_col.text()
+        print(f"DEBUG: Computing metrics. Label Col: {lc}, Score Col: {sc}")
+        
         y_true, y_score, refs = [], [], []
         
         for fp in paths:
             try:
+                # Read specific columns
                 df = read_features_columns(fp, [lc, sc], features_key=self.cfg.features_key)
+                
+                # DEBUG INFO
+                if lc not in df.columns:
+                    print(f"DEBUG: {os.path.basename(fp)} missing label column '{lc}'. Columns: {df.columns.tolist()}")
+                    continue
+                if sc not in df.columns:
+                    print(f"DEBUG: {os.path.basename(fp)} missing score column '{sc}'. Did you run scoring?")
+                    continue
+
                 s = df[lc].astype(str).str.lower()
-                mj = s.str.contains("junk") | (s=="1"); mc = s.str.contains("cell") | (s=="0")
+                
+                # Robust label matching
+                mj = s.str.contains("junk") | (s=="1") | (s=="1.0")
+                mc = s.str.contains("cell") | (s=="0") | (s=="0.0")
                 mask = mj|mc
-                if mask.sum()==0: continue
+                
+                count = mask.sum()
+                print(f"DEBUG: {os.path.basename(fp)} - Found {count} labeled rows.")
+                
+                if count == 0: continue
+                
                 yt = np.where(mj[mask], 1, 0).astype(int)
                 ys = df.loc[mask, sc].astype(float).to_numpy()
-                valid = ~np.isnan(ys); yt, ys = yt[valid], ys[valid]
+                
+                # Drop NaNs in Score (if any)
+                valid = ~np.isnan(ys)
+                if not valid.all():
+                    print(f"DEBUG: {os.path.basename(fp)} - Dropping {len(ys)-valid.sum()} rows with NaN scores.")
+                    
+                yt, ys = yt[valid], ys[valid]
                 idxs = np.where(mask.to_numpy())[0][valid]
+                
                 y_true.append(yt); y_score.append(ys); refs.extend([(fp, int(i)) for i in idxs])
-            except: pass
+            except Exception as e:
+                print(f"ERROR reading {fp}: {e}")
 
-        if not y_true: return QMessageBox.warning(self, "No data", "No labeled data found.")
+        if not y_true: return QMessageBox.warning(self, "No data", "No labeled data found.\nCheck the terminal for debug details.")
         y_true = np.concatenate(y_true); y_score = np.concatenate(y_score)
         
         cm, (fpr, tpr, auc), y_pred = binary_metrics(y_true, y_score, thr=0.5)
@@ -180,6 +207,7 @@ class MetricsTab(QWidget):
         
         ax = self.roc_plot.ax; ax.clear(); ax.plot(fpr, tpr, label=f"AUC={auc:.3f}"); ax.legend(); self.roc_plot.draw()
         
+        # Cache for galleries
         self.gallery_cache["TP"] = [refs[i] for i in np.where((y_true==1)&(y_pred==1))[0]]
         self.gallery_cache["TN"] = [refs[i] for i in np.where((y_true==0)&(y_pred==0))[0]]
         self.gallery_cache["FP"] = [refs[i] for i in np.where((y_true==0)&(y_pred==1))[0]]
@@ -208,7 +236,7 @@ class MetricsTab(QWidget):
             fp, ridx = items[idx]
             tiles.append({"h5_path":fp, "row_idx":ridx, "rgb":rgb_cache[fp][ridx], "label":title, "tooltip":f"{title}\n{os.path.basename(fp)}\n{ridx}"})
         gal.set_tiles(tiles)
-        gal.set_layout(n_cols=6, tile_h=84, tile_w=84) # Ensure layout is set
+        gal.set_layout(n_cols=6, tile_h=84, tile_w=84)
 
     def download_galleries(self):
         d = QFileDialog.getExistingDirectory(self, "Select Output Dir")
@@ -223,11 +251,13 @@ class MetricsTab(QWidget):
             for fp, ridx in items: by_file.setdefault(fp, []).append(ridx)
             
             for fp, rows in by_file.items():
-                imgs = read_images_by_indices(fp, np.array(rows), image_key=self.cfg.image_key)
-                for ridx, im in zip(rows, imgs):
-                    rgb = channels_to_rgb8bit(im)
-                    cv2.imwrite(os.path.join(cat_dir, f"{os.path.basename(fp)}_{ridx}.png"), rgb[...,::-1])
-                    count += 1
+                try:
+                    imgs = read_images_by_indices(fp, np.array(rows), image_key=self.cfg.image_key)
+                    for ridx, im in zip(rows, imgs):
+                        rgb = channels_to_rgb8bit(im)
+                        cv2.imwrite(os.path.join(cat_dir, f"{os.path.basename(fp)}_{ridx}.png"), rgb[...,::-1])
+                        count += 1
+                except: pass
         self.lbl_status.setText(f"Saved {count} images.")
         QMessageBox.information(self, "Done", f"Saved {count} images to {d}")
 
