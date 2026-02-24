@@ -124,11 +124,37 @@ class MetricsTab(QWidget):
 
     def load_selected_run(self):
         sel = self.table.selectedItems()
-        if not sel: return
-        p = sel[0].data(Qt.UserRole)
-        ckpt = os.path.join(p, "checkpoint_src.pt")
-        if not os.path.exists(ckpt): ckpt = os.path.join(p, "checkpoint.pt")
-        self._load_model_wrapper(ckpt)
+        if not sel:
+            QMessageBox.warning(self, "No Selection", "Please select a run from the table first.")
+            return
+        
+        folder_path = self.runs_table.item(sel[0].row(), 0).data(Qt.UserRole)
+        
+        # Aggressive checkpoint discovery
+        candidates = ["checkpoint.pt", "checkpoint_src.pt", "checkpoint_latest.pt"]
+        ckpt_path = None
+        
+        # 1. Check root of run folder
+        for c in candidates:
+            p = os.path.join(folder_path, c)
+            if os.path.exists(p):
+                ckpt_path = p
+                break
+        
+        # 2. Recursive search if not found (e.g. in checkpoints/ subfolder)
+        if not ckpt_path:
+            for root, _, files in os.walk(folder_path):
+                for f in files:
+                    if f.endswith(".pt"):
+                        ckpt_path = os.path.join(root, f)
+                        break
+                if ckpt_path: break
+
+        if not ckpt_path:
+            QMessageBox.warning(self, "Not Found", f"No .pt files found in {folder_path} or subdirectories.")
+            return
+            
+        self._load_model_wrapper(ckpt_path)
 
     def load_checkpoint_clicked(self):
         d = getattr(self.cfg, "runs_dir", None) or ""
@@ -158,45 +184,28 @@ class MetricsTab(QWidget):
         
         for fp in paths:
             try:
-                # Read specific columns
                 df = read_features_columns(fp, [lc, sc], features_key=self.cfg.features_key)
-                
-                # DEBUG INFO
-                if lc not in df.columns:
-                    print(f"DEBUG: {os.path.basename(fp)} missing label column '{lc}'. Columns: {df.columns.tolist()}")
-                    continue
+                if lc not in df.columns: continue
                 if sc not in df.columns:
-                    print(f"DEBUG: {os.path.basename(fp)} missing score column '{sc}'. Did you run scoring?")
+                    print(f"Skipping {os.path.basename(fp)} (No score col)")
                     continue
 
                 s = df[lc].astype(str).str.lower()
-                
-                # Robust label matching
                 mj = s.str.contains("junk") | (s=="1") | (s=="1.0")
                 mc = s.str.contains("cell") | (s=="0") | (s=="0.0")
                 mask = mj|mc
                 
-                count = mask.sum()
-                print(f"DEBUG: {os.path.basename(fp)} - Found {count} labeled rows.")
-                
-                if count == 0: continue
+                if mask.sum() == 0: continue
                 
                 yt = np.where(mj[mask], 1, 0).astype(int)
                 ys = df.loc[mask, sc].astype(float).to_numpy()
-                
-                # Drop NaNs in Score (if any)
-                valid = ~np.isnan(ys)
-                if not valid.all():
-                    print(f"DEBUG: {os.path.basename(fp)} - Dropping {len(ys)-valid.sum()} rows with NaN scores.")
-                    
-                yt, ys = yt[valid], ys[valid]
+                valid = ~np.isnan(ys); yt, ys = yt[valid], ys[valid]
                 idxs = np.where(mask.to_numpy())[0][valid]
                 
                 y_true.append(yt); y_score.append(ys); refs.extend([(fp, int(i)) for i in idxs])
-            except Exception as e:
-                print(f"ERROR reading {fp}: {e}")
+            except Exception as e: print(f"Err {fp}: {e}")
 
-        if not y_true: return QMessageBox.warning(self, "No data", "No labeled data found.\nCheck the terminal for debug details.")
+        if not y_true: return QMessageBox.warning(self, "No data", "No labeled data found.")
         y_true = np.concatenate(y_true); y_score = np.concatenate(y_score)
         
         cm, (fpr, tpr, auc), y_pred = binary_metrics(y_true, y_score, thr=0.5)
@@ -207,7 +216,6 @@ class MetricsTab(QWidget):
         
         ax = self.roc_plot.ax; ax.clear(); ax.plot(fpr, tpr, label=f"AUC={auc:.3f}"); ax.legend(); self.roc_plot.draw()
         
-        # Cache for galleries
         self.gallery_cache["TP"] = [refs[i] for i in np.where((y_true==1)&(y_pred==1))[0]]
         self.gallery_cache["TN"] = [refs[i] for i in np.where((y_true==0)&(y_pred==0))[0]]
         self.gallery_cache["FP"] = [refs[i] for i in np.where((y_true==0)&(y_pred==1))[0]]
@@ -229,12 +237,18 @@ class MetricsTab(QWidget):
         
         rgb_cache = {}
         for fp, row_idxs in by_file.items():
-            imgs = read_images_by_indices(fp, np.array(row_idxs), image_key=self.cfg.image_key)
-            rgb_cache[fp] = dict(zip(row_idxs, [channels_to_rgb8bit(im) for im in imgs]))
+            sorted_idxs = np.sort(np.array(row_idxs))
+            imgs = read_images_by_indices(fp, sorted_idxs, image_key=self.cfg.image_key)
+            if len(imgs) == len(sorted_idxs):
+                rgb_cache[fp] = dict(zip(sorted_idxs, [channels_to_rgb8bit(im) for im in imgs]))
+            else:
+                rgb_cache[fp] = {}
             
         for idx in picks:
             fp, ridx = items[idx]
-            tiles.append({"h5_path":fp, "row_idx":ridx, "rgb":rgb_cache[fp][ridx], "label":title, "tooltip":f"{title}\n{os.path.basename(fp)}\n{ridx}"})
+            img = rgb_cache.get(fp, {}).get(ridx)
+            if img is not None:
+                tiles.append({"h5_path":fp, "row_idx":ridx, "rgb":img, "label":title, "tooltip":f"{title}\n{os.path.basename(fp)}\n{ridx}"})
         gal.set_tiles(tiles)
         gal.set_layout(n_cols=6, tile_h=84, tile_w=84)
 
@@ -252,8 +266,9 @@ class MetricsTab(QWidget):
             
             for fp, rows in by_file.items():
                 try:
-                    imgs = read_images_by_indices(fp, np.array(rows), image_key=self.cfg.image_key)
-                    for ridx, im in zip(rows, imgs):
+                    sorted_rows = np.sort(np.array(rows))
+                    imgs = read_images_by_indices(fp, sorted_rows, image_key=self.cfg.image_key)
+                    for ridx, im in zip(sorted_rows, imgs):
                         rgb = channels_to_rgb8bit(im)
                         cv2.imwrite(os.path.join(cat_dir, f"{os.path.basename(fp)}_{ridx}.png"), rgb[...,::-1])
                         count += 1
@@ -288,11 +303,13 @@ class MetricsTab(QWidget):
         
         with torch.no_grad():
             for fp, rows in by_file.items():
-                imgs = read_images_by_indices(fp, np.array(rows), image_key=self.cfg.image_key)
+                sorted_rows = np.sort(np.array(rows))
+                imgs = read_images_by_indices(fp, sorted_rows, image_key=self.cfg.image_key)
                 xb = torch.from_numpy(imgs).permute(0,3,1,2).float().cuda()
                 emb = self.model(xb).cpu().numpy()
                 feats.append(emb)
         
+        if not feats: return
         feats = np.concatenate(feats)
         reducer = umap.UMAP()
         embedding = reducer.fit_transform(feats)

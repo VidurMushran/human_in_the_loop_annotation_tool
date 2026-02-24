@@ -25,89 +25,93 @@ def _create_run_dir(runs_root: str, suffix: str = "") -> Path:
     run_dir = new_run_dir(str(runs_root / dir_name))
     return run_dir
 
-def run_standard_job(
-    cfg: TrainConfig, 
-    job_name: str, 
-    train_items: list, 
-    val_items: list, 
-    timm_name: str, 
-    in_chans: int, 
-    runs_root: str, 
-    log_cb,
-    resume_checkpoint: str = None
-):
-    log_cb(f"Starting standard job: {job_name}")
-    
-    start_epoch = 1
-    optimizer_state = None
+def execute_job_from_def(job_def, log_cb, progress_cb=None):
+    """
+    Main entry point for the queue worker to run a job.
+    """
+    cfg = TrainConfig(**job_def['cfg'])
     
     # 1. Initialize Model
-    model = make_model(cfg.model_kind, timm_name, in_chans)
+    model = make_model(cfg.model_kind, job_def['timm_name'], job_def['in_chans'])
 
-    # 2. Resume Logic (Smart Load)
-    if resume_checkpoint and os.path.exists(resume_checkpoint):
-        log_cb(f"Resuming from {resume_checkpoint}...")
+    # 2. Paths
+    runs_root = Path(job_def.get('runs_root', 'runs'))
+    # Sanitize job name for folder
+    safe_name = "".join([c if c.isalnum() else "_" for c in job_def['job_name']])
+    run_dir = new_run_dir(str(runs_root / safe_name))
+    
+    # 3. Resume Logic
+    start_ep = 1
+    opt_state = None
+    resume_path = job_def.get('resume_checkpoint')
+    
+    # Check if we have a resume path OR a local 'latest' checkpoint from a crash
+    latest = run_dir / "checkpoint_latest.pt"
+    if latest.exists():
+        resume_path = str(latest)
+        log_cb(f"Found existing progress in run dir, resuming from: {latest}")
+
+    if resume_path and os.path.exists(resume_path):
         try:
-            ckpt = torch.load(resume_checkpoint, map_location="cpu")
-            # Use smart load to ignore size mismatches
+            ckpt = torch.load(resume_path, map_location='cpu')
             smart_load_state_dict(model, ckpt.get("model_state_dict", ckpt))
-            
-            if "optimizer_state_dict" in ckpt:
-                optimizer_state = ckpt["optimizer_state_dict"]
-            if "epoch" in ckpt:
-                start_epoch = ckpt["epoch"] + 1
-            log_cb(f"Resumed at epoch {start_epoch}")
+            if "optimizer_state_dict" in ckpt: opt_state = ckpt['optimizer_state_dict']
+            if "epoch" in ckpt: start_ep = ckpt['epoch'] + 1
+            log_cb(f"Resuming training from epoch {start_ep}")
         except Exception as e:
             log_cb(f"Resume failed ({e}). Starting fresh.")
 
-    # 3. Setup Directory
-    safe_arch = timm_name if cfg.model_kind == "timm_frozen" else "simple_cnn"
-    suffix = f"{safe_arch}_{cfg.inputs_mode}_{cfg.training_method}"
-    run_dir = _create_run_dir(runs_root, suffix=suffix)
+    # 4. Save Metadata
+    extra = {"job_name": job_def['job_name'], "mode": cfg.training_method, "inputs": cfg.inputs_mode}
+    write_run_yaml(run_dir, cfg.__dict__, extra)
 
-    # 4. Save Callback
-    extra = {"job_name": job_name, "mode": cfg.training_method, "inputs": cfg.inputs_mode}
-    write_run_yaml(run_dir, cfg=cfg.__dict__, extra=extra)
-
+    # 5. Callbacks
     def save_callback(epoch, net, opt, stats):
+        # Save resume point
         state = {
-            "model_state_dict": net.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "epoch": epoch,
-            "train_config": cfg.__dict__,
-            "extra": extra,
-            "stats": stats
+            'model_state_dict': net.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'epoch': epoch,
+            'train_config': cfg.__dict__
         }
         torch.save(state, run_dir / "checkpoint_latest.pt")
-
-    # 5. Execute Training
-    trained_model, best = train_model(
-        model, train_items, val_items, cfg, 
-        log_cb=log_cb, 
-        start_epoch=start_epoch, 
-        optimizer_state=optimizer_state, 
-        save_cb=save_callback
-    )
-
-    # 6. Final Artifacts
-    try:
-        ckpt_src = run_dir / "checkpoint_src.pt"
-        torch.save({
-            "model_state_dict": trained_model.state_dict(),
-            "train_config": cfg.__dict__, "extra": extra, "best": best
-        }, ckpt_src)
-        write_checkpoint(run_dir, str(ckpt_src))
-        metrics = dict(best) if isinstance(best, dict) else {"best": str(best)}
-        metrics.pop("state", None)
-        write_metrics(run_dir, metrics)
-    except Exception as e:
-        log_cb(f"Warning: Artifact save failed: {e}")
         
-    return trained_model
+        # Report progress
+        if progress_cb:
+            progress_cb(epoch, cfg.epochs, stats)
 
+    # 6. Run Training
+    if job_def['method'] == 'pseudo-labeling':
+        # PL logic is slightly different (iterative), handled by run_pseudo_label_job logic
+        # For simplicity in this unified executor, we delegate back to the PL logic function
+        # Note: This means PL won't get per-epoch progress updates on the UI yet, 
+        # but standard jobs will.
+        run_pseudo_label_job(
+            cfg, job_def['job_name'], job_def['labeled_items'], job_def['unlabeled_items'],
+            job_def['timm_name'], job_def['in_chans'], str(runs_root),
+            job_def['pl_iters'], job_def['pl_thresh'], log_cb
+        )
+    else:
+        model, best = train_model(
+            model, job_def['train_items'], job_def['val_items'], 
+            cfg, log_cb, start_ep, opt_state, save_callback
+        )
+        
+        # Final Save
+        torch.save({
+            'model_state_dict': model.state_dict(), 
+            'train_config': cfg.__dict__, 
+            'best': best
+        }, run_dir / "checkpoint.pt")
+        
+        # Cleanup resume file to save space? Optional. 
+        # if latest.exists(): os.remove(latest)
+        
+        write_metrics(run_dir, best)
+
+# Keep the PL function for the delegate call above
 def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, init_unlabeled: list, timm_name: str, in_chans: int, runs_root: str, pl_iters: int, pl_thresh: float, log_cb):
     log_cb(f"Starting Pseudo-Labeling: {job_name}")
-    
     current_train = copy.deepcopy(init_labeled)
     current_unlabeled = copy.deepcopy(init_unlabeled)
     
@@ -124,7 +128,6 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
         log_cb(f"Train size: {len(curr_train)} | Unlabeled pool: {len(current_unlabeled)}")
         
         model = make_model(cfg.model_kind, timm_name, in_chans)
-        
         cfg.training_method = "supervised"
         trained_model, best = train_model(model, curr_train, curr_val, cfg, log_cb=log_cb)
         
@@ -132,18 +135,8 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
             safe_arch = timm_name if cfg.model_kind == "timm_frozen" else "simple_cnn"
             suffix = f"{safe_arch}_{cfg.inputs_mode}_PL"
             run_dir = _create_run_dir(runs_root, suffix=suffix)
-            
-            extra = {"job_name": job_name, "mode": "pseudo-labeling", "final_train_size": len(curr_train)}
-            write_run_yaml(run_dir, cfg=cfg.__dict__, extra=extra)
-            
             ckpt_src = run_dir / "checkpoint_src.pt"
-            torch.save({
-                "model_state_dict": trained_model.state_dict(),
-                "train_config": cfg.__dict__, "best": best
-            }, ckpt_src)
-            write_checkpoint(run_dir, str(ckpt_src))
-            metrics = dict(best) if isinstance(best, dict) else {"best": str(best)}
-            write_metrics(run_dir, metrics)
+            torch.save({"model_state_dict": trained_model.state_dict(), "train_config": cfg.__dict__, "best": best}, ckpt_src)
             log_cb(f"Finished. Saved to {run_dir}")
             break
             
@@ -155,7 +148,6 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
         for it in current_unlabeled: files_to_items[it.h5_path].append(it)
         
         new_labeled, remaining = [], []
-        
         with torch.no_grad():
             for fp, items in files_to_items.items():
                 row_indices = np.array([it.row_idx for it in items])
@@ -165,27 +157,17 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
                     try:
                         imgs = read_images_by_indices(fp, batch_idx, image_key=cfg.image_key)
                         xb = torch.from_numpy(imgs).permute(0, 3, 1, 2).float()
-                        if xb.shape[-1] != cfg.target_hw:
-                            xb = torch.nn.functional.interpolate(xb, size=(cfg.target_hw, cfg.target_hw))
-                        
+                        if xb.shape[-1] != cfg.target_hw: xb = torch.nn.functional.interpolate(xb, size=(cfg.target_hw, cfg.target_hw))
                         xb = xb.to(cfg.device)
-                        
-                        # Forward pass through backbone -> classifier
-                        # Note: make_model returns a model that outputs embeddings in forward()
-                        # We must call model.classifier explicitly or check if it's supervised
-                        # In app/ml/train.py we do: emb = model(x); logits = model.classifier(emb)
-                        # We must replicate that here:
                         emb = trained_model(xb)
                         logits = trained_model.classifier(emb)
                         probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-                        
                         for pi, p in enumerate(probs):
                             it = batch_items[pi]
                             if p >= pl_thresh: new_labeled.append(Item(it.h5_path, it.row_idx, 1, it.cluster))
                             elif p <= (1.0-pl_thresh): new_labeled.append(Item(it.h5_path, it.row_idx, 0, it.cluster))
                             else: remaining.append(it)
-                    except Exception as e:
-                        remaining.extend(batch_items)
+                    except: remaining.extend(batch_items)
 
         log_cb(f"Pseudo-labeled {len(new_labeled)} samples.")
         curr_train.extend(new_labeled)

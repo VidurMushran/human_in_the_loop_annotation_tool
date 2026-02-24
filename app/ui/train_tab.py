@@ -16,7 +16,7 @@ from PyQt5.QtCore import Qt, QSettings
 
 from ..ui.widgets.multicheck_dropdown import MultiCheckDropdown
 from ..utils.qt_threading import run_in_thread
-from ..training.queue_manager import PersistentQueueManager
+from ..training.queue_manager import PersistentQueueManager 
 from ..utils.model_helpers import load_model_from_checkpoint
 from ..training.jobs import run_scoring_job
 from ..ml.train import TrainConfig
@@ -33,15 +33,22 @@ class TrainTab(QWidget):
         self.model = None
         self.settings = QSettings("VidurLab", "JunkAnnotator")
         
-        # Persistent Queue Manager handles bg jobs & resuming
         self.queue_manager = PersistentQueueManager(self)
         self.queue_manager.log_signal.connect(self._log)
         self.queue_manager.job_started.connect(self._on_job_started)
+        self.queue_manager.job_progress.connect(self._on_job_progress) # NEW
         self.queue_manager.job_finished.connect(self._on_job_finished)
         self.queue_manager.queue_empty.connect(lambda: self._log("Queue finished."))
         
         self._build()
         self._load_ui_state()
+        
+        # Check for existing jobs on load
+        if self.queue_manager.queue:
+            self._log(f"Resumed with {len(self.queue_manager.queue)} jobs in queue.")
+            # Populate UI list
+            for j in self.queue_manager.queue:
+                self.queue_list.addItem(f"⏳ {j['job_name']}")
 
     def _build(self):
         lay = QVBoxLayout(self)
@@ -103,7 +110,6 @@ class TrainTab(QWidget):
 
         # --- Queue Actions ---
         q_row = QHBoxLayout()
-        # Single "Add to Queue" button - The PersistentQueueManager handles execution in bg thread
         self.btn_sweep = QPushButton("Add Sweep to Queue")
         self.btn_sweep.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
         self.btn_sweep.clicked.connect(self.queue_sweep_clicked)
@@ -111,7 +117,7 @@ class TrainTab(QWidget):
         self.btn_start_q = QPushButton("Start Queue Worker")
         self.btn_start_q.clicked.connect(lambda: self.queue_manager.start_worker())
         
-        self.queue_list = QListWidget(); self.queue_list.setMaximumHeight(80)
+        self.queue_list = QListWidget(); self.queue_list.setMaximumHeight(100)
         
         q_row.addWidget(self.btn_sweep); q_row.addWidget(self.btn_start_q)
         lay.addLayout(q_row); lay.addWidget(QLabel("Persistent Job Queue:")); lay.addWidget(self.queue_list)
@@ -126,14 +132,29 @@ class TrainTab(QWidget):
 
         self.log = QTextEdit(); self.log.setReadOnly(True); lay.addWidget(self.log, 2)
 
-    def _log(self, s): self.log.append(str(s))
+    def _log(self, s): 
+        self.log.append(str(s))
+        # Auto-scroll
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
     def _on_job_started(self, n): 
         self._log(f"Started: {n}")
-        if i := self.queue_list.findItems(n, Qt.MatchContains): i[0].setText(f"🔄 {n}"); i[0].setBackground(Qt.yellow)
-        else: self.queue_list.addItem(f"🔄 {n}") # In case resumed from file and not in UI list yet
+        if i := self.queue_list.findItems(n, Qt.MatchContains): 
+            i[0].setText(f"🔄 {n}") 
+            i[0].setBackground(Qt.yellow)
+        else: 
+            self.queue_list.addItem(f"🔄 {n}")
+
+    def _on_job_progress(self, name, info):
+        # Update list item text with live stats
+        if items := self.queue_list.findItems(name, Qt.MatchContains):
+            # Keep the name part, update the info part
+            items[0].setText(f"🔄 {name}  [{info}]")
 
     def _on_job_finished(self, n, s): 
-        if i := self.queue_list.findItems(n, Qt.MatchContains): i[0].setText(f"{'✅' if s else '❌'} {n}"); i[0].setBackground(Qt.green if s else Qt.red)
+        if i := self.queue_list.findItems(n, Qt.MatchContains): 
+            i[0].setText(f"{'✅' if s else '❌'} {n}")
+            i[0].setBackground(Qt.green if s else Qt.red)
 
     def browse_resume(self):
         p, _ = QFileDialog.getOpenFileName(self, "Checkpoint", self.annotate_tab.root_dir or "", "*.pt")
@@ -225,19 +246,12 @@ class TrainTab(QWidget):
         lbl_col = self.annotate_tab.label_col; cl_col = self.cluster_col.text().strip()
         labeled, unlabeled = [], []
         
-        # FIX: For SSL, we want EVERYTHING (labeled + unlabeled) to be training data (unlabeled)
-        # For Supervised, we only want labeled.
-        # For Pseudo-Labeling, we want Labeled as Train, Unlabeled as Pool.
-        
         for fp, mode in specs:
-            # Always gather all rows as potentially unlabeled
             try: 
                 df = pd.read_hdf(fp, key=self.cfg.features_key)
-                # If mode is unlabeled or SSL is used, add to unlabeled pool
                 unlabeled.extend([Item(fp, i, -1, -1) for i in df.index])
             except: pass
             
-            # If explicit label mode, add to labeled pool
             if mode != "unlabeled (all rows)":
                 labeled.extend(self._items_from_file(fp, mode, lbl_col, cl_col))
 
@@ -245,13 +259,17 @@ class TrainTab(QWidget):
         combs = list(itertools.product(models, inputs, methods))
         self._log(f"Generated {len(combs)} jobs.")
 
+        loss_name = self.loss_menu.currentText()
+
         for arch, inp, meth in combs:
             kind, tname = ("timm_frozen", arch.split(":")[1]) if "timm" in arch else ("simple_cnn", "resnet18")
-            job_name = f"{arch} | {inp} | {meth}"
+            
+            # IMPROVED NAME: Include loss
+            job_name = f"{arch} | {inp} | {meth} | {loss_name}"
             
             cfg = _make_train_config(
                 model_kind=kind, timm_name=tname, inputs_mode=inp, training_method=meth,
-                loss_function=self.loss_menu.currentText(),
+                loss_function=loss_name,
                 epochs=int(self.epochs.value()), batch_size=256, device="cuda", 
                 image_key=self.cfg.image_key, aug_flags=tuple(self.aug_menu.selected()), 
                 max_blur_sigma=self.blur_sigma.value()
@@ -260,22 +278,15 @@ class TrainTab(QWidget):
             ch = base_ch
             if "mask" in inp: ch += 1
             
-            # Data Split
-            # SSL uses EVERYTHING (labeled + unlabeled) as one pool
-            # Supervised uses labeled only
             train_items_pool = labeled
             if meth == "self-supervised":
-                # Combine distinct items from labeled & unlabeled to maximize data
-                # Using a set of (path, idx) to uniq would be safer, but simplistic concat here:
-                train_items_pool = unlabeled # Unlabeled usually contains everything if loaded correctly above
-                if not train_items_pool: train_items_pool = labeled # Fallback
+                train_items_pool = unlabeled if unlabeled else labeled
             
             rng = np.random.default_rng(0); idx = rng.permutation(len(train_items_pool))
             n_val = int(len(train_items_pool) * self.val_frac.value())
             val_items = [train_items_pool[i] for i in idx[:n_val]]
             train_items = [train_items_pool[i] for i in idx[n_val:]]
 
-            # Define Job
             job_def = {
                 "job_name": job_name,
                 "runs_root": runs_root,
@@ -286,8 +297,6 @@ class TrainTab(QWidget):
                 "resume_checkpoint": self.resume_path.text().strip() or None,
                 "pl_iters": int(self.pl_iters.value()),
                 "pl_thresh": self.pl_thresh.value(),
-                # Store paths to items, not items themselves, to be picklable/JSONable ideally
-                # But PersistentQueue pickles the whole dict, so objects are fine.
                 "train_items": train_items,
                 "val_items": val_items,
                 "labeled_items": labeled,
@@ -297,6 +306,7 @@ class TrainTab(QWidget):
             self.queue_manager.add_job(job_def)
             self.queue_list.addItem(f"⏳ {job_name}")
 
+        # Auto start is handled by add_job, but we can ensure it here
         self.queue_manager.start_worker()
 
     def score_clicked(self):
