@@ -15,3 +15,7 @@ Output directory: runs
 [simple_cnn | image_only | pseudo-labeling] [ep 5/5] loss=0.0426 val_acc=0.990 val_auc=0.999
 [simple_cnn | image_only | pseudo-labeling] Done in 81.5s.
 [simple_cnn | image_only | pseudo-labeling] Scoring unlabeled pool (Bulk IO)...
+[simple_cnn | image_only | pseudo-labeling] Found 809490 new labels.
+[simple_cnn | image_only | pseudo-labeling] 
+--- PL Iteration 2/3 ---
+[simple_cnn | image_only | pseudo-labeling] Train size: 845661 | Unlabeled pool: 309307

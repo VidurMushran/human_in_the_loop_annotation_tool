@@ -1,190 +1,107 @@
-# app/ml/train.py
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Callable, Dict, Tuple, Optional
-import time
-import numpy as np
 import torch
-import torch.nn.functional as F
+import numpy as np
+from dataclasses import dataclass
+from app.ml.dataset import H5StreamDataset
+from app.ml.loss import get_loss_function, nt_xent_loss
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score, accuracy_score
 
-from app.ml.dataset import H5StreamDataset, Item
-
 @dataclass
 class TrainConfig:
-    model_kind: str = "simple_cnn"         
-    timm_name: str = "resnet18"           
+    model_kind: str = "simple_cnn"
+    timm_name: str = "resnet18"
     inputs_mode: str = "image_only"
     training_method: str = "supervised"
+    loss_function: str = "cross_entropy"
     epochs: int = 5
     batch_size: int = 256
     lr: float = 1e-3
     device: str = "cuda"
     image_key: str = "images"
-    mask_key: str = "masks"               
+    mask_key: str = "masks"
+    feature_key: str = "features"
     target_hw: int = 75
-    aug_flags: tuple[str, ...] = ()
+    aug_flags: tuple = ()
     max_blur_sigma: float = 0.0
     seed: int = 0
 
-def nt_xent_loss(z1, z2, temperature=0.5):
-    """ Simple Contrastive Loss for Self-Supervised Learning """
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-    z = torch.cat([z1, z2], dim=0)
-    
-    sim_matrix = torch.matmul(z, z.T) / temperature
-    sim_matrix.fill_diagonal_(-1e9) 
-    
-    N = z1.size(0)
-    labels = torch.cat([torch.arange(N) + N, torch.arange(N)], dim=0).to(z1.device)
-    
-    loss = F.cross_entropy(sim_matrix, labels)
-    return loss
-
-@torch.no_grad()
-def eval_binary(model, dl, device: str):
-    model.eval()
-    ys = []
-    ps = []
-    for batch in dl:
-        xb = batch[0] if isinstance(batch, (tuple, list)) else batch
-        yb = batch[-1] if isinstance(batch, (tuple, list)) else batch[1]
-        
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        prob1 = torch.softmax(model(xb), dim=1)[:, 1]
-        
-        ys.append(yb.detach().cpu().numpy())
-        ps.append(prob1.detach().cpu().numpy())
-        
-    y = np.concatenate(ys)
-    p = np.concatenate(ps)
-    pred = (p >= 0.5).astype(int)
-    acc = accuracy_score(y, pred)
-    try:
-        auc = roc_auc_score(y, p)
-    except Exception:
-        auc = float("nan")
-    return float(acc), float(auc)
-
-
-def train_model(
-    model,
-    train_items: List[Item],
-    val_items: List[Item],
-    cfg: TrainConfig,
-    log_cb: Callable[[str], None],
-    start_epoch: int = 1,
-    optimizer_state: Optional[Dict] = None,
-    save_cb: Optional[Callable[[int, torch.nn.Module, torch.optim.Optimizer, Dict], None]] = None
-) -> Tuple[torch.nn.Module, Dict]:
-    
-    device = cfg.device if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(int(cfg.seed))
-    np.random.seed(int(cfg.seed))
-
+def train_model(model, train_items, val_items, cfg: TrainConfig, log_cb, start_epoch=1, optimizer_state=None, save_cb=None):
+    device = cfg.device
     model = model.to(device)
-
-    train_ds = H5StreamDataset(
-        train_items, image_key=cfg.image_key, mask_key=cfg.mask_key, target_hw=cfg.target_hw,
-        aug_flags=cfg.aug_flags, max_blur_sigma=cfg.max_blur_sigma, seed=cfg.seed,
-        inputs_mode=cfg.inputs_mode, training_method=cfg.training_method
-    )
-    val_ds = H5StreamDataset(
-        val_items, image_key=cfg.image_key, mask_key=cfg.mask_key, target_hw=cfg.target_hw,
-        aug_flags=(), max_blur_sigma=0.0, seed=cfg.seed,
-        inputs_mode=cfg.inputs_mode, training_method=cfg.training_method
-    )
-
-    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.lr)
     
-    if optimizer_state is not None:
-        try:
-            opt.load_state_dict(optimizer_state)
-            log_cb(f"Resumed optimizer state.")
-        except Exception as e:
-            log_cb(f"Warning: Could not load optimizer state: {e}")
+    # Loss
+    criterion = get_loss_function(cfg.loss_function, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    if optimizer_state: optimizer.load_state_dict(optimizer_state)
+
+    # Data
+    ds_kws = dict(image_key=cfg.image_key, mask_key=cfg.mask_key, feature_key=cfg.feature_key, 
+                  target_hw=cfg.target_hw, inputs_mode=cfg.inputs_mode, training_method=cfg.training_method)
+    
+    train_ds = H5StreamDataset(train_items, aug_flags=cfg.aug_flags, max_blur_sigma=cfg.max_blur_sigma, **ds_kws)
+    val_ds = H5StreamDataset(val_items, aug_flags=(), max_blur_sigma=0, **ds_kws)
+    
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2)
 
     best_metric = -float('inf')
     best_state = None
-    t0 = time.time()
 
-    try:
-        for ep in range(start_epoch, cfg.epochs + 1):
-            model.train()
-            losses = []
-
-            for batch in train_dl:
-                opt.zero_grad(set_to_none=True)
-                
-                if cfg.training_method == "self-supervised":
-                    (x1, x2), yb = batch
-                    x1, x2 = x1.to(device), x2.to(device)
-                    z1 = model(x1)
-                    z2 = model(x2)
-                    loss = nt_xent_loss(z1, z2)
-                else: 
-                    if cfg.inputs_mode == "image_and_features":
-                        xb, feats, yb = batch
-                        xb, yb = xb.to(device), yb.to(device)
-                        logits = model(xb) 
-                    else:
-                        xb, yb = batch
-                        xb, yb = xb.to(device), yb.to(device)
-                        logits = model(xb)
-                    loss = F.cross_entropy(logits, yb)
-
-                loss.backward()
-                opt.step()
-                losses.append(float(loss.item()))
-
-            # --- VALIDATION ---
-            model.eval()
-            current_stats = {}
+    for ep in range(start_epoch, cfg.epochs+1):
+        model.train()
+        epoch_losses = []
+        
+        for batch in train_dl:
+            optimizer.zero_grad()
             
             if cfg.training_method == "self-supervised":
-                val_losses = []
-                with torch.no_grad():
-                    for (x1, x2), yb in val_dl:
-                        z1, z2 = model(x1.to(device)), model(x2.to(device))
-                        val_losses.append(nt_xent_loss(z1, z2).item())
-                avg_val_loss = np.mean(val_losses)
-                log_cb(f"[ep {ep}/{cfg.epochs}] Train SSL Loss={np.mean(losses):.4f} Val SSL Loss={avg_val_loss:.4f}")
-                
-                metric_val = -avg_val_loss
-                current_stats = {"val_loss": avg_val_loss}
+                (v1, v2), feats, _ = batch
+                z1 = model(v1.to(device), feats.to(device))
+                z2 = model(v2.to(device), feats.to(device))
+                loss = nt_xent_loss(z1, z2)
             else:
-                acc, auc = eval_binary(model, val_dl, device)
-                log_cb(f"[ep {ep}/{cfg.epochs}] loss={np.mean(losses):.4f} val_acc={acc:.3f} val_auc={auc:.3f}")
-                metric_val = float(acc)
-                current_stats = {"acc": acc, "auc": auc, "loss": np.mean(losses)}
-
-            # Track best
-            if metric_val > best_metric:
-                best_metric = metric_val
-                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                img, feats, y = batch
+                emb = model(img.to(device), feats.to(device)) # 128D
+                logits = model.classifier(emb) # 2D
+                loss = criterion(logits, y.to(device))
             
-            # --- SAVE CALLBACK ---
-            if save_cb:
-                save_cb(ep, model, opt, current_stats)
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(loss.item())
 
-        dt = float(time.time() - t0)
-        log_cb(f"Done in {dt:.1f}s.")
-        
-        if best_state is not None:
-            model.load_state_dict(best_state)
+        # Eval
+        model.eval()
+        val_metric = 0
+        with torch.no_grad():
+            if cfg.training_method == "self-supervised":
+                vl = []
+                for (v1,v2), f, _ in val_dl:
+                    z1 = model(v1.to(device), f.to(device))
+                    z2 = model(v2.to(device), f.to(device))
+                    vl.append(nt_xent_loss(z1, z2).item())
+                val_metric = -np.mean(vl)
+                log_cb(f"[Ep {ep}] Train Loss: {np.mean(epoch_losses):.3f} | Val SSL Loss: {np.mean(vl):.3f}")
+            else:
+                ys, ps = [], []
+                for img, f, y in val_dl:
+                    emb = model(img.to(device), f.to(device))
+                    logits = model.classifier(emb)
+                    ys.append(y.cpu().numpy())
+                    ps.append(torch.softmax(logits, 1)[:,1].cpu().numpy())
+                
+                y = np.concatenate(ys); p = np.concatenate(ps)
+                acc = accuracy_score(y, p>=0.5)
+                try: auc = roc_auc_score(y, p)
+                except: auc = 0.0
+                val_metric = acc
+                log_cb(f"[Ep {ep}] Loss: {np.mean(epoch_losses):.3f} | Acc: {acc:.3f} | AUC: {auc:.3f}")
 
-        best = {
-            "best_metric": float(best_metric),
-            "train_time_s": float(dt),
-        }
-        return model, best
+        if val_metric > best_metric:
+            best_metric = val_metric
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
-    finally:
-        train_ds.close()
-        val_ds.close()
+        if save_cb: save_cb(ep, model, optimizer, {"metric": val_metric})
+
+    if best_state: model.load_state_dict(best_state)
+    return model, {"best_metric": float(best_metric)}
