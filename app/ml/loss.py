@@ -1,3 +1,4 @@
+# app/ml/loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,13 +19,40 @@ class FocalLoss(nn.Module):
         elif self.reduction == 'sum': return focal_loss.sum()
         return focal_loss
 
+def nt_xent_loss(z1, z2, temperature=0.5):
+    """ 
+    Normalized Temperature-scaled Cross Entropy Loss for SSL (SimCLR).
+    Expects z1, z2 to be (Batch, Dim).
+    """
+    device = z1.device
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+    
+    # Concatenate: (2N, Dim)
+    z = torch.cat([z1, z2], dim=0)
+    
+    # Cosine similarity matrix: (2N, 2N)
+    sim_matrix = torch.matmul(z, z.T) / temperature
+    
+    # Mask out self-similarity
+    sim_matrix.fill_diagonal_(-1e9)
+    
+    # Targets: z1[i] matches z2[i]. 
+    # In the concat tensor, z1 is 0..N-1, z2 is N..2N-1.
+    # z1[i] (index i) should match z2[i] (index i+N)
+    # z2[i] (index i+N) should match z1[i] (index i)
+    N = z1.size(0)
+    labels = torch.cat([torch.arange(N) + N, torch.arange(N)], dim=0).to(device)
+    
+    loss = F.cross_entropy(sim_matrix, labels)
+    return loss
+
 def get_loss_function(name: str, device="cuda"):
     name = name.lower()
     if name == "cross_entropy":
         return nn.CrossEntropyLoss()
     elif name == "weighted_ce":
-        # Weight class 1 (junk) higher generally, typically calculated from dataset
-        # Defaulting to 1:3 ratio for now, user can tune in code if needed
+        # Default 1:3 weighting for class imbalance (Cell:Junk)
         weights = torch.tensor([1.0, 3.0]).to(device)
         return nn.CrossEntropyLoss(weight=weights)
     elif name == "focal_loss":
