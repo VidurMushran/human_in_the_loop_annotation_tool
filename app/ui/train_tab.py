@@ -16,7 +16,7 @@ from PyQt5.QtCore import Qt, QSettings
 
 from ..ui.widgets.multicheck_dropdown import MultiCheckDropdown
 from ..utils.qt_threading import run_in_thread
-from ..training.queue_manager import PersistentQueueManager # New persistent manager
+from ..training.queue_manager import PersistentQueueManager
 from ..utils.model_helpers import load_model_from_checkpoint
 from ..training.jobs import run_scoring_job
 from ..ml.train import TrainConfig
