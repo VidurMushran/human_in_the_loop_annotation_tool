@@ -3,8 +3,13 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import os
 import numpy as np
+import pandas as pd
 from pathlib import Path
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QComboBox, QLineEdit, QSpinBox, QCheckBox, QMessageBox)
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, 
+    QComboBox, QLineEdit, QSpinBox, QCheckBox, QMessageBox
+)
+from PyQt5.QtCore import QSettings
 
 from ..data.discover import discover_hdf5s
 from ..data.index import MultiFileIndex
@@ -18,7 +23,6 @@ from .widgets.label_editor import LabelEditor
 def pd_to_float_safe(s):
     try: return s.astype(float).to_numpy()
     except: 
-        import pandas as pd
         return pd.to_numeric(s, errors="coerce").to_numpy()
 
 class GalleryPane(QWidget):
@@ -38,6 +42,7 @@ class AnnotateTab(QWidget):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.settings = QSettings("VidurLab", "JunkAnnotator")
         self.root_dir = None
         self.files = []
         self.selected_paths = []
@@ -53,6 +58,11 @@ class AnnotateTab(QWidget):
         self.page_left = 0
         self.page_right = 0
         self._build_ui()
+        
+        # Auto-load last root
+        last_root = self.settings.value("last_root_dir", "")
+        if last_root and os.path.isdir(last_root):
+            self.set_root_dir(last_root)
 
     def _ui_label_from_storage(self, v):
         try:
@@ -186,8 +196,12 @@ class AnnotateTab(QWidget):
         if not d: return
         p = Path(d); data = p.parent / "data"
         if not data.is_dir(): return QMessageBox.warning(self, "Missing data", f"No data at {data}")
-        self.root_dir = str(data)
-        self.files = discover_hdf5s(str(data))
+        self.set_root_dir(str(data))
+
+    def set_root_dir(self, path):
+        self.root_dir = path
+        self.settings.setValue("last_root_dir", path)
+        self.files = discover_hdf5s(path)
         self.file_list.set_files(self.files)
 
     def on_file_selection_changed(self, paths):
@@ -301,14 +315,15 @@ class AnnotateTab(QWidget):
     
     def _apply_gallery_layouts(self):
         nc = int(self.n_cols.value()); th = int(self.cfg.tile_px); tw = th * len(self._selected_tiles_spec())
-        for p in [self.single_pane, self.dual_left_pane, self.dual_right_pane]: p.gallery.set_layout(nc, th, tw)
+        for p in [self.single_pane, self.dual_left_pane, self.dual_right_pane]: 
+            p.gallery.set_layout(n_cols=nc, tile_h=th, tile_w=tw)
 
     def _sync_gallery_visibility(self):
         d = self.chk_dual.isChecked()
         self.single_pane.setVisible(not d); self.dual_left_pane.setVisible(d); self.dual_right_pane.setVisible(d)
         self.btn_select_all.setVisible(not d); self.btn_select_all_left.setVisible(d); self.btn_select_all_right.setVisible(d)
 
-    # File Ops (Delegated)
+    # File Ops
     def label_entire_selected_files(self):
         if not self.selected_paths: return QMessageBox.info(self, "No files", "Select files.")
         if QMessageBox.question(self, "Confirm", f"Label {len(self.selected_paths)} files as '{self.active_label}'?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
@@ -320,8 +335,6 @@ class AnnotateTab(QWidget):
         self.rebuild_index()
 
     def save_current_view(self):
-        # ... (Keep specific save logic or move if desired, sticking to requested scope) ...
-        # This one is complex because it reads UI state of tiles. Leaving as is per instructions to prioritize cleanliness.
         tiles = self._current_tiles()
         if not tiles: return
         by_file = {}

@@ -1,7 +1,7 @@
 # app/ml/train.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Callable, Dict, Tuple
+from typing import List, Callable, Dict, Tuple, Optional
 import time
 import numpy as np
 import torch
@@ -13,10 +13,10 @@ from app.ml.dataset import H5StreamDataset, Item
 
 @dataclass
 class TrainConfig:
-    model_kind: str = "small_cnn"         
+    model_kind: str = "simple_cnn"         
     timm_name: str = "resnet18"           
-    inputs_mode: str = "image_only"       # 'image_only', 'image_and_mask', 'image_and_features'
-    training_method: str = "supervised"   # 'supervised', 'self-supervised', 'pseudo-labeling'
+    inputs_mode: str = "image_only"
+    training_method: str = "supervised"
     epochs: int = 5
     batch_size: int = 256
     lr: float = 1e-3
@@ -45,7 +45,6 @@ def nt_xent_loss(z1, z2, temperature=0.5):
 
 @torch.no_grad()
 def eval_binary(model, dl, device: str):
-    """ Restored Evaluation Function for Supervised Learning """
     model.eval()
     ys = []
     ps = []
@@ -77,6 +76,9 @@ def train_model(
     val_items: List[Item],
     cfg: TrainConfig,
     log_cb: Callable[[str], None],
+    start_epoch: int = 1,
+    optimizer_state: Optional[Dict] = None,
+    save_cb: Optional[Callable[[int, torch.nn.Module, torch.optim.Optimizer, Dict], None]] = None
 ) -> Tuple[torch.nn.Module, Dict]:
     
     device = cfg.device if torch.cuda.is_available() else "cpu"
@@ -86,17 +88,10 @@ def train_model(
     model = model.to(device)
 
     train_ds = H5StreamDataset(
-        train_items,
-        image_key=cfg.image_key,
-        mask_key=cfg.mask_key,
-        target_hw=cfg.target_hw,
-        aug_flags=cfg.aug_flags,
-        max_blur_sigma=cfg.max_blur_sigma,
-        seed=cfg.seed,
-        inputs_mode=cfg.inputs_mode,
-        training_method=cfg.training_method
+        train_items, image_key=cfg.image_key, mask_key=cfg.mask_key, target_hw=cfg.target_hw,
+        aug_flags=cfg.aug_flags, max_blur_sigma=cfg.max_blur_sigma, seed=cfg.seed,
+        inputs_mode=cfg.inputs_mode, training_method=cfg.training_method
     )
-    
     val_ds = H5StreamDataset(
         val_items, image_key=cfg.image_key, mask_key=cfg.mask_key, target_hw=cfg.target_hw,
         aug_flags=(), max_blur_sigma=0.0, seed=cfg.seed,
@@ -107,29 +102,33 @@ def train_model(
     val_dl = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.lr)
+    
+    if optimizer_state is not None:
+        try:
+            opt.load_state_dict(optimizer_state)
+            log_cb(f"Resumed optimizer state.")
+        except Exception as e:
+            log_cb(f"Warning: Could not load optimizer state: {e}")
 
     best_metric = -float('inf')
     best_state = None
     t0 = time.time()
 
     try:
-        for ep in range(1, cfg.epochs + 1):
+        for ep in range(start_epoch, cfg.epochs + 1):
             model.train()
             losses = []
 
             for batch in train_dl:
                 opt.zero_grad(set_to_none=True)
                 
-                # --- ROUTING BASED ON CONFIG ---
                 if cfg.training_method == "self-supervised":
                     (x1, x2), yb = batch
                     x1, x2 = x1.to(device), x2.to(device)
                     z1 = model(x1)
                     z2 = model(x2)
                     loss = nt_xent_loss(z1, z2)
-                    
                 else: 
-                    # Supervised / Pseudo-labeling execution
                     if cfg.inputs_mode == "image_and_features":
                         xb, feats, yb = batch
                         xb, yb = xb.to(device), yb.to(device)
@@ -138,15 +137,16 @@ def train_model(
                         xb, yb = batch
                         xb, yb = xb.to(device), yb.to(device)
                         logits = model(xb)
-                        
                     loss = F.cross_entropy(logits, yb)
 
                 loss.backward()
                 opt.step()
                 losses.append(float(loss.item()))
 
-            # --- VALIDATION EVALUATION ---
+            # --- VALIDATION ---
             model.eval()
+            current_stats = {}
+            
             if cfg.training_method == "self-supervised":
                 val_losses = []
                 with torch.no_grad():
@@ -156,20 +156,26 @@ def train_model(
                 avg_val_loss = np.mean(val_losses)
                 log_cb(f"[ep {ep}/{cfg.epochs}] Train SSL Loss={np.mean(losses):.4f} Val SSL Loss={avg_val_loss:.4f}")
                 
-                if -avg_val_loss > best_metric:
-                    best_metric = -avg_val_loss
-                    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-                    
+                metric_val = -avg_val_loss
+                current_stats = {"val_loss": avg_val_loss}
             else:
                 acc, auc = eval_binary(model, val_dl, device)
                 log_cb(f"[ep {ep}/{cfg.epochs}] loss={np.mean(losses):.4f} val_acc={acc:.3f} val_auc={auc:.3f}")
+                metric_val = float(acc)
+                current_stats = {"acc": acc, "auc": auc, "loss": np.mean(losses)}
 
-                if acc > best_metric:
-                    best_metric = float(acc)
-                    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            # Track best
+            if metric_val > best_metric:
+                best_metric = metric_val
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            
+            # --- SAVE CALLBACK ---
+            if save_cb:
+                save_cb(ep, model, opt, current_stats)
 
         dt = float(time.time() - t0)
         log_cb(f"Done in {dt:.1f}s.")
+        
         if best_state is not None:
             model.load_state_dict(best_state)
 

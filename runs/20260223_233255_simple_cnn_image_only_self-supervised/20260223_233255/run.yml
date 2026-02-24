@@ -1,0 +1,24 @@
+config:
+  model_kind: simple_cnn
+  timm_name: resnet18
+  inputs_mode: image_only
+  training_method: self-supervised
+  epochs: 100
+  batch_size: 256
+  lr: 0.001
+  device: cuda
+  image_key: images
+  mask_key: masks
+  target_hw: 75
+  aug_flags:
+  - hflip
+  - vflip
+  - rotate90
+  max_blur_sigma: 1.5
+  seed: 0
+job_name: simple_cnn | image_only | self-supervised
+mode: self-supervised
+inputs: image_only
+training_method: self-supervised
+in_chans: 4
+n_train: 36171

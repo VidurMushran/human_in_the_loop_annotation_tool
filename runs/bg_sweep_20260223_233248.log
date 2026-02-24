@@ -1,0 +1,12 @@
+--- Headless Training Worker ---
+Loading config: runs/bg_sweep_20260223_233248.pkl
+Found 1 jobs to run.
+Output directory: runs
+
+[Job 1/1] simple_cnn | image_only | self-supervised
+[simple_cnn | image_only | self-supervised] Starting standard job: simple_cnn | image_only | self-supervised
+[simple_cnn | image_only | self-supervised] [ep 1/100] Train SSL Loss=5.3676 Val SSL Loss=5.0986
+[simple_cnn | image_only | self-supervised] [ep 2/100] Train SSL Loss=5.1311 Val SSL Loss=5.0737
+[simple_cnn | image_only | self-supervised] [ep 3/100] Train SSL Loss=5.0990 Val SSL Loss=5.0474
+[simple_cnn | image_only | self-supervised] [ep 4/100] Train SSL Loss=5.0796 Val SSL Loss=5.0453
+[simple_cnn | image_only | self-supervised] [ep 5/100] Train SSL Loss=5.0683 Val SSL Loss=5.0432

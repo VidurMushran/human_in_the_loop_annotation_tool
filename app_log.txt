@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/run_app.py", line 1, in <module>
+    from app.main import main
+  File "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/app/main.py", line 3, in <module>
+    from app.ui.main_window import MainWindow
+  File "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/app/ui/main_window.py", line 4, in <module>
+    from app.ui.train_tab import TrainTab
+  File "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/app/ui/train_tab.py", line 16, in <module>
+    from ..training.jobs import run_standard_job, run_pseudo_label_job, run_scoring_job
+  File "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/app/training/jobs.py", line 12, in <module>
+    from app.ml.train import train_model, TrainConfig
+  File "/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/app/ml/train.py", line 12, in <module>
+    from app.ml.train import train_model, TrainConfig
+ImportError: cannot import name 'train_model' from partially initialized module 'app.ml.train' (most likely due to a circular import) (/mnt/deepstore/Vidur/Junk_Classification/junk_gui_app/app/ml/train.py)

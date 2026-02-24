@@ -1,9 +1,11 @@
 # app/training/jobs.py
 from __future__ import annotations
+import os
 import time
 import copy
 import torch
 import numpy as np
+from collections import defaultdict
 from pathlib import Path
 from torch.utils.data import DataLoader
 
@@ -11,7 +13,9 @@ from app.ml.train import train_model, TrainConfig
 from app.ml.models import SimpleCNN, make_timm_frozen_linear
 from app.ml.dataset import Item, H5StreamDataset
 from app.ml.score import score_h5_file
+from app.data.h5io import read_images_by_indices
 from app.experiments.registry import new_run_dir, write_run_yaml, write_metrics, write_checkpoint
+from app.utils.model_helpers import load_model_from_checkpoint
 
 def _create_run_dir(runs_root: str, suffix: str = "") -> Path:
     runs_root = Path(runs_root)
@@ -21,14 +25,51 @@ def _create_run_dir(runs_root: str, suffix: str = "") -> Path:
     run_dir = new_run_dir(str(runs_root / dir_name))
     return run_dir
 
-def run_standard_job(cfg: TrainConfig, job_name: str, train_items: list, val_items: list, timm_name: str, in_chans: int, runs_root: str, log_cb):
+def run_standard_job(
+    cfg: TrainConfig, 
+    job_name: str, 
+    train_items: list, 
+    val_items: list, 
+    timm_name: str, 
+    in_chans: int, 
+    runs_root: str, 
+    log_cb,
+    resume_checkpoint: str = None
+):
     log_cb(f"Starting standard job: {job_name}")
     
-    if cfg.model_kind == "simple_cnn":
-        model = SimpleCNN(in_ch=in_chans, n_classes=2)
+    start_epoch = 1
+    optimizer_state = None
+    
+    # 1. Initialize or Resume Model
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        log_cb(f"Resuming from {resume_checkpoint}...")
+        try:
+            ckpt = torch.load(resume_checkpoint, map_location="cpu")
+            if cfg.model_kind == "simple_cnn":
+                model = SimpleCNN(in_ch=in_chans, n_classes=2)
+            else:
+                model = make_timm_frozen_linear(timm_name, in_chans=in_chans, n_classes=2)
+                
+            model.load_state_dict(ckpt.get("model_state_dict", ckpt))
+            
+            if "optimizer_state_dict" in ckpt:
+                optimizer_state = ckpt["optimizer_state_dict"]
+            if "epoch" in ckpt:
+                start_epoch = ckpt["epoch"] + 1
+                
+            log_cb(f"Resuming at epoch {start_epoch}")
+        except Exception as e:
+            log_cb(f"Resume failed: {e}. Starting fresh.")
+            if cfg.model_kind == "simple_cnn": model = SimpleCNN(in_ch=in_chans, n_classes=2)
+            else: model = make_timm_frozen_linear(timm_name, in_chans=in_chans, n_classes=2)
     else:
-        model = make_timm_frozen_linear(timm_name, in_chans=in_chans, n_classes=2)
+        if cfg.model_kind == "simple_cnn":
+            model = SimpleCNN(in_ch=in_chans, n_classes=2)
+        else:
+            model = make_timm_frozen_linear(timm_name, in_chans=in_chans, n_classes=2)
 
+    # 2. Setup Directory
     safe_arch = timm_name if cfg.model_kind == "timm_frozen" else "simple_cnn"
     suffix = f"{safe_arch}_{cfg.inputs_mode}_{cfg.training_method}"
     run_dir = _create_run_dir(runs_root, suffix=suffix)
@@ -39,8 +80,29 @@ def run_standard_job(cfg: TrainConfig, job_name: str, train_items: list, val_ite
     }
     write_run_yaml(run_dir, cfg=cfg.__dict__, extra=extra)
 
-    trained_model, best = train_model(model, train_items, val_items, cfg, log_cb=log_cb)
+    # 3. Define Per-Epoch Save Callback
+    def save_callback(epoch, net, opt, stats):
+        latest_path = run_dir / "checkpoint_latest.pt"
+        state = {
+            "model_state_dict": net.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "epoch": epoch,
+            "train_config": cfg.__dict__,
+            "extra": extra,
+            "stats": stats
+        }
+        torch.save(state, latest_path)
 
+    # 4. Train
+    trained_model, best = train_model(
+        model, train_items, val_items, cfg, 
+        log_cb=log_cb, 
+        start_epoch=start_epoch, 
+        optimizer_state=optimizer_state, 
+        save_cb=save_callback
+    )
+
+    # 5. Final Save
     try:
         ckpt_src = run_dir / "checkpoint_src.pt"
         torch.save({
@@ -79,6 +141,7 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
             model = make_timm_frozen_linear(timm_name, in_chans=in_chans, n_classes=2)
         
         cfg.training_method = "supervised"
+        
         trained_model, best = train_model(model, curr_train, curr_val, cfg, log_cb=log_cb)
         
         if iter_idx == pl_iters - 1 or len(current_unlabeled) == 0:
@@ -103,28 +166,39 @@ def run_pseudo_label_job(cfg: TrainConfig, job_name: str, init_labeled: list, in
             log_cb(f"Finished. Final run saved to {run_dir}")
             break
             
-        log_cb("Scoring unlabeled pool...")
+        log_cb("Scoring unlabeled pool (Bulk IO)...")
         trained_model.eval()
         trained_model.to(cfg.device)
         
-        u_ds = H5StreamDataset(current_unlabeled, image_key=cfg.image_key, target_hw=cfg.target_hw, aug_flags=(), inputs_mode=cfg.inputs_mode, training_method="supervised")
-        u_dl = DataLoader(u_ds, batch_size=256, shuffle=False, num_workers=2)
+        files_to_items = defaultdict(list)
+        for it in current_unlabeled: files_to_items[it.h5_path].append(it)
         
         new_labeled, remaining = [], []
-        g_idx = 0
+        
         with torch.no_grad():
-            for batch in u_dl:
-                xb = batch[0] if isinstance(batch, (tuple, list)) else batch
-                xb = xb.to(cfg.device)
-                probs = torch.softmax(trained_model(xb), dim=1)[:, 1].cpu().numpy()
-                for p in probs:
-                    it = current_unlabeled[g_idx]
-                    if p >= pl_thresh: new_labeled.append(Item(it.h5_path, it.row_idx, 1, it.cluster))
-                    elif p <= (1.0 - pl_thresh): new_labeled.append(Item(it.h5_path, it.row_idx, 0, it.cluster))
-                    else: remaining.append(it)
-                    g_idx += 1
-                    
-        log_cb(f"Found {len(new_labeled)} high-confidence pseudo-labels.")
+            for fp, items in files_to_items.items():
+                row_indices = np.array([it.row_idx for it in items])
+                for i in range(0, len(items), 256):
+                    batch_items = items[i:i+256]
+                    batch_idx = row_indices[i:i+256]
+                    try:
+                        imgs = read_images_by_indices(fp, batch_idx, image_key=cfg.image_key)
+                        xb = torch.from_numpy(imgs).permute(0, 3, 1, 2).float()
+                        if xb.shape[-1] != cfg.target_hw:
+                            import torch.nn.functional as F
+                            xb = F.interpolate(xb, size=(cfg.target_hw, cfg.target_hw), mode="bilinear")
+                        
+                        xb = xb.to(cfg.device)
+                        probs = torch.softmax(trained_model(xb), dim=1)[:, 1].cpu().numpy()
+                        
+                        for pi, p in enumerate(probs):
+                            it = batch_items[pi]
+                            if p >= pl_thresh: new_labeled.append(Item(it.h5_path, it.row_idx, 1, it.cluster))
+                            elif p <= (1.0-pl_thresh): new_labeled.append(Item(it.h5_path, it.row_idx, 0, it.cluster))
+                            else: remaining.append(it)
+                    except: remaining.extend(batch_items)
+
+        log_cb(f"Found {len(new_labeled)} new labels.")
         curr_train.extend(new_labeled)
         current_unlabeled = remaining
 
@@ -136,4 +210,4 @@ def run_scoring_job(model, paths, score_col, cfg, log_cb):
             log_cb(f"Scoring {os.path.basename(fp)} ...")
             score_h5_file(model, fp, score_col=score_col, image_key=cfg.image_key, features_key=cfg.features_key, device="cuda", batch_size=256, target_hw=75, log_cb=log_cb)
         except Exception as e:
-            log_cb(f"[ERROR] Failed to score {os.path.basename(fp)}: {e}")
+            log_cb(f"Error scoring {fp}: {e}")
