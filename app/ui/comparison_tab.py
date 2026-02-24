@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
 from PyQt5.QtCore import Qt
 from app.utils.model_helpers import load_model_from_checkpoint
 from app.data.h5io import read_images_by_indices
-from app.ui.widgets.gallery import GalleryWidget
+from app.ui.widgets.gallery_pane import GalleryPane
 from app.imaging.render import channels_to_rgb8bit
 
 class ComparisonTab(QWidget):
@@ -22,7 +22,6 @@ class ComparisonTab(QWidget):
     def _build(self):
         lay = QVBoxLayout(self)
         
-        # Controls
         row = QHBoxLayout()
         self.btn_load_a = QPushButton("Load Model A")
         self.btn_load_a.clicked.connect(lambda: self.load_model('A'))
@@ -40,12 +39,12 @@ class ComparisonTab(QWidget):
         row.addWidget(self.btn_run)
         lay.addLayout(row)
         
-        # Galleries for Disagreement
         split = QSplitter(Qt.Horizontal)
-        self.gal_a_junk_b_cell = GalleryWidget("A=Junk | B=Cell")
-        self.gal_a_cell_b_junk = GalleryWidget("A=Cell | B=Junk")
-        split.addWidget(self.gal_a_junk_b_cell)
-        split.addWidget(self.gal_a_cell_b_junk)
+        cb = lambda p,r,b: None
+        self.gal_a_junk = GalleryPane("A=Junk | B=Cell", cb)
+        self.gal_a_cell = GalleryPane("A=Cell | B=Junk", cb)
+        split.addWidget(self.gal_a_junk)
+        split.addWidget(self.gal_a_cell)
         lay.addWidget(split)
 
     def load_model(self, tag):
@@ -69,7 +68,6 @@ class ComparisonTab(QWidget):
         disagree_ab = [] # A=Junk(1), B=Cell(0)
         disagree_ba = [] # A=Cell(0), B=Junk(1)
         
-        # Sampling 1000 items max for speed
         all_items = []
         import h5py
         for fp in paths:
@@ -83,7 +81,6 @@ class ComparisonTab(QWidget):
             picks_idx = rng.choice(len(all_items), 1000, replace=False)
             all_items = [all_items[i] for i in picks_idx]
             
-        # Group by file
         by_file = {}
         for fp, r in all_items: by_file.setdefault(fp, []).append(r)
         
@@ -94,12 +91,9 @@ class ComparisonTab(QWidget):
                 imgs = read_images_by_indices(fp, np.array(rows), image_key=self.cfg.image_key)
                 xb = torch.from_numpy(imgs).permute(0,3,1,2).float().cuda()
                 
-                # Inference A
-                # Assumes simple classifier output. If SSL model, need to add classifier head logic
                 la = self.model_a(xb); pa = torch.softmax(la, 1)[:,1].cpu().numpy()
                 pred_a = (pa >= 0.5).astype(int)
                 
-                # Inference B
                 lb = self.model_b(xb); pb = torch.softmax(lb, 1)[:,1].cpu().numpy()
                 pred_b = (pb >= 0.5).astype(int)
                 
@@ -110,6 +104,8 @@ class ComparisonTab(QWidget):
                     if ya==1 and yb==0: disagree_ab.append(item)
                     elif ya==0 and yb==1: disagree_ba.append(item)
                     
-        self.gal_a_junk_b_cell.set_tiles(disagree_ab)
-        self.gal_a_cell_b_junk.set_tiles(disagree_ba)
+        self.gal_a_junk.set_tiles(disagree_ab)
+        self.gal_a_cell.set_tiles(disagree_ba)
+        self.gal_a_junk.set_layout(6, 84, 84)
+        self.gal_a_cell.set_layout(6, 84, 84)
         QMessageBox.information(self, "Done", f"Found {len(disagree_ab)} A=J/B=C and {len(disagree_ba)} A=C/B=J disagreements.")

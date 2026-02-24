@@ -17,26 +17,14 @@ from ..data.h5io import list_feature_columns, read_images_by_indices, write_feat
 from ..data.batch_ops import batch_label_files, rebuild_vidur_files
 from ..imaging.render import channels_to_rgb8bit, _scale_to_u8_percentile, _gray_to_rgb, _downsample_nn_hwc
 from .widgets.file_list import FileListWidget
-from .widgets.gallery import GalleryWidget
 from .widgets.label_editor import LabelEditor
+# FIX: Import GalleryPane
+from .widgets.gallery_pane import GalleryPane
 
 def pd_to_float_safe(s):
     try: return s.astype(float).to_numpy()
     except: 
         return pd.to_numeric(s, errors="coerce").to_numpy()
-
-class GalleryPane(QWidget):
-    def __init__(self, title, cb):
-        super().__init__()
-        lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0)
-        self.title = QLabel(title); self.title.setStyleSheet("font-weight: 600;")
-        lay.addWidget(self.title)
-        self.gallery = GalleryWidget(); self.gallery.tile_clicked.connect(cb)
-        lay.addWidget(self.gallery, 1)
-    def set_title(self, t): self.title.setText(t)
-    def set_tiles(self, t): self.gallery.set_tiles(t)
-    def tiles(self): return self.gallery.tiles()
-    def set_tile_label(self, p, r, l): self.gallery.set_tile_label(p, r, l)
 
 class AnnotateTab(QWidget):
     def __init__(self, cfg):
@@ -59,7 +47,6 @@ class AnnotateTab(QWidget):
         self.page_right = 0
         self._build_ui()
         
-        # Auto-load last root
         last_root = self.settings.value("last_root_dir", "")
         if last_root and os.path.isdir(last_root):
             self.set_root_dir(last_root)
@@ -316,7 +303,7 @@ class AnnotateTab(QWidget):
     def _apply_gallery_layouts(self):
         nc = int(self.n_cols.value()); th = int(self.cfg.tile_px); tw = th * len(self._selected_tiles_spec())
         for p in [self.single_pane, self.dual_left_pane, self.dual_right_pane]: 
-            p.gallery.set_layout(n_cols=nc, tile_h=th, tile_w=tw)
+            p.set_layout(n_cols=nc, tile_h=th, tile_w=tw)
 
     def _sync_gallery_visibility(self):
         d = self.chk_dual.isChecked()
