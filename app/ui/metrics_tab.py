@@ -123,12 +123,13 @@ class MetricsTab(QWidget):
         ax.set_yticks(y); ax.set_yticklabels(names, fontsize=8); ax.invert_yaxis(); self.chart.draw()
 
     def load_selected_run(self):
-        sel = self.table.selectedItems()
+        sel = self.table.selectedItems() # This was correct
         if not sel:
             QMessageBox.warning(self, "No Selection", "Please select a run from the table first.")
             return
         
-        folder_path = self.runs_table.item(sel[0].row(), 0).data(Qt.UserRole)
+        # FIX: Change 'self.runs_table' to 'self.table'
+        folder_path = self.table.item(sel[0].row(), 0).data(Qt.UserRole)
         
         # Aggressive checkpoint discovery
         candidates = ["checkpoint.pt", "checkpoint_src.pt", "checkpoint_latest.pt"]

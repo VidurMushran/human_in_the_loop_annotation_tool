@@ -37,13 +37,11 @@ class LegacySimpleCNN(nn.Module):
         self.flatten = nn.Flatten()
         self.classifier = nn.Linear(128, n_classes)
 
-    def forward(self, x, features=None):
+    def forward(self, x):
         x = self.feat(x)
         x = self.flatten(x)
-        # Old model returned logits directly, not embeddings
-        # But to be compatible with new UI that expects embeddings, we return 'x' as embedding
-        # and let the wrapper call classifier(x)
-        return x 
+        x = self.classifier(x)
+        return x
 
 class TimmModel(nn.Module):
     def __init__(self, name, in_chans=3, n_classes=2, embed_dim=128):

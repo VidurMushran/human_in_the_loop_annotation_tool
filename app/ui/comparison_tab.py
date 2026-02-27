@@ -88,21 +88,51 @@ class ComparisonTab(QWidget):
         
         with torch.no_grad():
             for fp, rows in by_file.items():
+                rows = sorted(rows) 
                 imgs = read_images_by_indices(fp, np.array(rows), image_key=self.cfg.image_key)
+                if len(imgs) == 0: continue
+                
                 xb = torch.from_numpy(imgs).permute(0,3,1,2).float().cuda()
                 
-                la = self.model_a(xb); pa = torch.softmax(la, 1)[:,1].cpu().numpy()
-                pred_a = (pa >= 0.5).astype(int)
+                # --- FIX START ---
+                # 1. Get Embeddings
+                emb_a = self.model_a(xb)
+                emb_b = self.model_b(xb)
                 
-                lb = self.model_b(xb); pb = torch.softmax(lb, 1)[:,1].cpu().numpy()
+                # 2. Pass Embeddings to Classifier to get Logits (Size 2)
+                logits_a = self.model_a.classifier(emb_a)
+                logits_b = self.model_b.classifier(emb_b)
+                
+                # 3. Calculate Probabilities from Logits
+                pa = torch.softmax(logits_a, 1)[:,1].cpu().numpy()
+                pb = torch.softmax(logits_b, 1)[:,1].cpu().numpy()
+                # --- FIX END ---
+                
+                pred_a = (pa >= 0.5).astype(int)
                 pred_b = (pb >= 0.5).astype(int)
                 
+                print(f"File: {os.path.basename(fp)}")
+                print(f"  Model A Positive Rate: {pred_a.mean():.2f}")
+                print(f"  Model B Positive Rate: {pred_b.mean():.2f}")
+                print(f"  Matches: {(pred_a == pred_b).sum()} / {len(pred_a)}")
+                # --- DEBUGGING END ---
+
                 rgb_imgs = [channels_to_rgb8bit(im) for im in imgs]
                 
+                # 3. BUILD ITEMS (Now that pred_a/b exist)
                 for i, (ya, yb) in enumerate(zip(pred_a, pred_b)):
-                    item = {"h5_path":fp, "row_idx":rows[i], "rgb":rgb_imgs[i], "label":"", "tooltip":f"{fp} {rows[i]}"}
-                    if ya==1 and yb==0: disagree_ab.append(item)
-                    elif ya==0 and yb==1: disagree_ba.append(item)
+                    item = {
+                        "h5_path": fp, 
+                        "row_idx": rows[i], # Matches the sorted rows
+                        "rgb": rgb_imgs[i], 
+                        "label": "", 
+                        "tooltip": f"{fp} {rows[i]}"
+                    }
+                    
+                    if ya == 1 and yb == 0: 
+                        disagree_ab.append(item)
+                    elif ya == 0 and yb == 1: 
+                        disagree_ba.append(item)
                     
         self.gal_a_junk.set_tiles(disagree_ab)
         self.gal_a_cell.set_tiles(disagree_ba)

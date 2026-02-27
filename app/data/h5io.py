@@ -113,7 +113,6 @@ def write_features_column_inplace(h5_path: str, col_name: str, values: np.ndarra
 
         df[col_name] = values
         
-        # Reset index to ensure clean 'table' format
         df.reset_index(drop=True, inplace=True)
         
         df.to_hdf(h5_path, key=features_key, mode='a', format='table', data_columns=True, complevel=5, complib='blosc')
@@ -125,5 +124,6 @@ def read_images_by_indices(h5_path: str, sorted_indices: np.ndarray, image_key: 
     try:
         with h5py.File(h5_path, 'r') as f:
             return f[image_key][sorted_indices]
-    except Exception:
+    except Exception as e:
+        print(f"Error reading images from {h5_path}: {e}")
         return np.array([])
